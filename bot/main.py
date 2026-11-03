@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import asyncio
 import gc
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass, field
+from functools import lru_cache
 from http.server import BaseHTTPRequestHandler, HTTPServer
 import io
 import logging
@@ -12,6 +15,7 @@ import time
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
+import httpx
 from dotenv import load_dotenv
 from email_validator import EmailNotValidError, validate_email
 import numpy as np
@@ -20,6 +24,7 @@ from rapidocr_onnxruntime import RapidOCR
 from supabase import create_client
 from telegram import Update
 from telegram.constants import ChatType
+from telegram.error import BadRequest, NetworkError, RetryAfter, TimedOut
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
 from telegram.request import HTTPXRequest
 
@@ -31,6 +36,7 @@ logging.basicConfig(
 )
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
+logging.getLogger("hpack").setLevel(logging.WARNING)
 log = logging.getLogger("creator-bot")
 
 SUPABASE_URL = os.getenv("SUPABASE_URL", "").strip()
@@ -41,6 +47,19 @@ DAILY_TARGET = int(os.getenv("DAILY_TARGET", "50"))
 MAX_IMAGE_MB = int(os.getenv("MAX_IMAGE_MB", "15"))
 ADMIN_ID = int(os.getenv("AUTHORIZED_USER_ID", "0"))
 
+# ----------------------------------------------------------------- Speed / bulk settings
+CPU_COUNT = os.cpu_count() or 4
+OCR_WORKERS = max(1, int(os.getenv("OCR_WORKERS", str(max(1, min(4, CPU_COUNT // 2))))))
+OCR_THREADS = max(1, int(os.getenv("OCR_THREADS", str(max(1, CPU_COUNT // OCR_WORKERS)))))
+IO_EXTRA_WORKERS = 2
+TARGET_OCR_WIDTH = int(os.getenv("OCR_WIDTH", "720"))
+PROGRESS_EVERY = float(os.getenv("PROGRESS_EVERY", "2.5"))
+BATCH_IDLE_SECS = float(os.getenv("BATCH_IDLE_SECS", "3"))
+
+# How many Supabase calls may run at the same time. 1 = fully safe (OCR is the real bottleneck anyway).
+DB_MAX_CONCURRENCY = max(1, int(os.getenv("DB_MAX_CONCURRENCY", "1")))
+DB_RETRIES = max(1, int(os.getenv("DB_RETRIES", "5")))
+
 try:
     TZ = ZoneInfo(os.getenv("TIMEZONE", "Asia/Kolkata"))
 except Exception as exc:
@@ -49,12 +68,103 @@ except Exception as exc:
 if not all([SUPABASE_URL, SUPABASE_KEY, BOT_TOKEN]) or ADMIN_ID <= 0:
     raise SystemExit("Missing required .env settings: SUPABASE_URL, SUPABASE_KEY, TELEGRAM_BOT_TOKEN, AUTHORIZED_USER_ID")
 
+# ----------------------------------------------------------------- Thread-safe Supabase access
+# ROOT CAUSE OF THE BULK FAILURES: the sync Supabase client (one httpx connection pool) was shared by many
+# threads via asyncio.to_thread. Concurrent use corrupts requests and the proxy answers "400 Bad Request".
+# FIX: every thread gets its own client, DB calls are limited by a semaphore, and transient errors are retried.
 log.info("Connecting to Supabase at %s", SUPABASE_URL)
-db = create_client(SUPABASE_URL, SUPABASE_KEY)
+_db_local = threading.local()
+_db_generation = 0
+_db_gen_lock = threading.Lock()
 
-log.info("Loading 20x RapidOCR engine (ONNX Runtime)...")
-engine = RapidOCR()
-log.info("RapidOCR initialized successfully.")
+
+def _bump_db_generation() -> None:
+    """Forces every thread to build a fresh client on its next call."""
+    global _db_generation
+    with _db_gen_lock:
+        _db_generation += 1
+
+
+def get_db():
+    client = getattr(_db_local, "client", None)
+    if client is None or getattr(_db_local, "gen", -1) != _db_generation:
+        client = create_client(SUPABASE_URL, SUPABASE_KEY)
+        _db_local.client = client
+        _db_local.gen = _db_generation
+    return client
+
+
+class _DBProxy:
+    """Drop-in replacement for the old global `db`: db.table(...) / db.rpc(...) use the calling thread's client."""
+
+    def __getattr__(self, name):
+        return getattr(get_db(), name)
+
+
+db = _DBProxy()
+get_db()  # fail fast on bad credentials
+
+_db_sem: asyncio.Semaphore | None = None
+
+
+def _get_db_sem() -> asyncio.Semaphore:
+    global _db_sem
+    if _db_sem is None:
+        _db_sem = asyncio.Semaphore(DB_MAX_CONCURRENCY)
+    return _db_sem
+
+
+def _is_transient_db_error(exc: Exception) -> bool:
+    if isinstance(exc, (httpx.TransportError, httpx.TimeoutException)):
+        return True
+    text = str(exc).lower()
+    markers = (
+        "json could not be generated", "bad request", "<html", "502", "503", "504",
+        "gateway", "timed out", "timeout", "connection", "reset by peer", "remote protocol",
+        "server disconnected", "temporarily unavailable",
+    )
+    return any(m in text for m in markers)
+
+
+async def run_db(fn):
+    last_exc: Exception | None = None
+    for attempt in range(DB_RETRIES):
+        try:
+            async with _get_db_sem():
+                return await asyncio.to_thread(fn)
+        except Exception as exc:
+            last_exc = exc
+            if attempt < DB_RETRIES - 1 and _is_transient_db_error(exc):
+                log.warning("DB call failed (attempt %d/%d): %s", attempt + 1, DB_RETRIES, str(exc)[:300])
+                _bump_db_generation()
+                await asyncio.sleep(0.4 * (attempt + 1))
+                continue
+            raise
+    raise last_exc  # pragma: no cover
+
+
+# ----------------------------------------------------------------- OCR engines
+_tl = threading.local()
+
+
+def _make_engine():
+    try:
+        return RapidOCR(intra_op_num_threads=OCR_THREADS)
+    except Exception:
+        return RapidOCR()
+
+
+def get_engine():
+    eng = getattr(_tl, "engine", None)
+    if eng is None:
+        log.info("Loading 20x RapidOCR engine (ONNX Runtime) in thread %s...", threading.current_thread().name)
+        eng = _make_engine()
+        _tl.engine = eng
+        log.info("RapidOCR initialized successfully in thread %s.", threading.current_thread().name)
+    return eng
+
+
+OCR_POOL = ThreadPoolExecutor(max_workers=OCR_WORKERS, thread_name_prefix="ocr", initializer=get_engine)
 
 # -----------------------------------------------------------------------------
 # 20X TAXONOMY: LOCATIONS DATABASE
@@ -201,6 +311,7 @@ DOMAIN_TYPOS = {
     "icld.com": "icloud.com",
 }
 
+
 def now_local() -> datetime:
     return datetime.now(TZ)
 
@@ -227,7 +338,9 @@ def parse_count(value: str | None) -> int | None:
 
 
 class EmailEngine:
+    # lru_cache: same token on pass 1/2/3 (or repeated across screenshots) skips the live DNS lookup.
     @staticmethod
+    @lru_cache(maxsize=4096)
     def clean(raw_candidate: str) -> str | None:
         if not raw_candidate or "@" not in raw_candidate:
             return None
@@ -529,6 +642,8 @@ def _extract_from_boxes(boxes_data: list, full_w: int, full_h: int) -> dict:
 
 
 def multi_pass_20x_ocr(image_bytes: bytes) -> dict:
+    _tl.last_pass = None  # debug only: which pass produced the final result
+
     try:
         with Image.open(io.BytesIO(image_bytes)) as opened:
             base_img = ImageOps.exif_transpose(opened).convert("RGB")
@@ -539,14 +654,12 @@ def multi_pass_20x_ocr(image_bytes: bytes) -> dict:
     crop_frac = 0.62 if full_h / max(full_w, 1) > 1.5 else 1.0
     cropped = base_img.crop((0, 0, full_w, int(full_h * crop_frac)))
 
-    # CLAMP RESOLUTION FOR RENDER 512MB RAM ENVIRONMENT
-    # Mobile screenshots > 720px width exceed RAM when processed in full ONNX matrices.
-    target_ocr_width = 720
+    target_ocr_width = TARGET_OCR_WIDTH
     if cropped.width > target_ocr_width:
         ocr_scale = target_ocr_width / float(cropped.width)
         target_ocr_height = int(cropped.height * ocr_scale)
         work_img = cropped.resize((target_ocr_width, target_ocr_height), Image.Resampling.LANCZOS)
-        log.info("Optimized input for Render RAM: %dx%d -> %dx%d (scale: %.3f)", full_w, full_h, target_ocr_width, target_ocr_height, ocr_scale)
+        log.info("Optimized input: %dx%d -> %dx%d (scale: %.3f)", full_w, full_h, target_ocr_width, target_ocr_height, ocr_scale)
     else:
         ocr_scale = 1.0
         work_img = cropped.copy()
@@ -559,17 +672,16 @@ def multi_pass_20x_ocr(image_bytes: bytes) -> dict:
     def run_ocr_pass(img_to_run: Image.Image) -> list | None:
         buf = io.BytesIO()
         img_to_run.save(buf, format="JPEG", quality=90)
-        res, _ = engine(buf.getvalue())
+        res, _ = get_engine()(buf.getvalue())
         if not res:
             return None
-        # Project coordinates back to original full screenshot scale
         unscaled_res = []
         for b, t, c in res:
             orig_box = [[p[0] / ocr_scale, p[1] / ocr_scale] for p in b]
             unscaled_res.append((orig_box, t, c))
         return unscaled_res
 
-    # --- PASS 1: Auto-Inverted High Contrast Scan ---
+    # --- PASS 1 ---
     log.info("=== [PASS 1/3] Auto-Inverted High Contrast Scan ===")
     pass1_img = ImageOps.invert(work_img) if is_dark_mode else work_img.copy()
     pass1_img = ImageOps.autocontrast(pass1_img, cutoff=1)
@@ -578,10 +690,11 @@ def multi_pass_20x_ocr(image_bytes: bytes) -> dict:
 
     if data1 and data1["email"] and data1["instagram_username"] and data1["followers"] is not None:
         log.info("✅ Pass 1 extracted all primary fields successfully.")
+        _tl.last_pass = 1
         gc.collect()
         return data1
 
-    # --- PASS 2: Sharpening & Enhanced Contrast (Memory Safe) ---
+    # --- PASS 2 ---
     log.info("=== [PASS 2/3] Sharpening & Edge Boost ===")
     pass2_img = work_img.filter(ImageFilter.UnsharpMask(radius=2, percent=150, threshold=2))
     pass2_img = ImageOps.autocontrast(pass2_img)
@@ -597,12 +710,13 @@ def multi_pass_20x_ocr(image_bytes: bytes) -> dict:
             data2["niche"] = data2["niche"] or data1.get("niche")
         if data2["email"] and data2["instagram_username"]:
             log.info("✅ Pass 2 successfully completed recovery.")
+            _tl.last_pass = 2
             gc.collect()
             return data2
     else:
         data2 = None
 
-    # --- PASS 3: Grayscale Contrast Fallback ---
+    # --- PASS 3 ---
     log.info("=== [PASS 3/3] Dynamic Grayscale Contrast Fallback ===")
     pass3_img = ImageOps.grayscale(work_img)
     pass3_img = ImageEnhance.Contrast(pass3_img).enhance(2.0)
@@ -617,9 +731,11 @@ def multi_pass_20x_ocr(image_bytes: bytes) -> dict:
             data3["post_count"] = data3["post_count"] or best.get("post_count")
             data3["location"] = data3["location"] or best.get("location")
             data3["niche"] = data3["niche"] or best.get("niche")
+        _tl.last_pass = 3
         gc.collect()
         return data3
 
+    _tl.last_pass = 3
     gc.collect()
     return data2 or data1 or {
         "email": None, "instagram_username": None, "full_name": "UNKNOWN",
@@ -628,16 +744,56 @@ def multi_pass_20x_ocr(image_bytes: bytes) -> dict:
     }
 
 
-# ----------------------------------------------------------------- Database
-async def run_db(fn):
-    return await asyncio.to_thread(fn)
+def ocr_task(image_bytes: bytes) -> tuple[dict, int | None]:
+    """Runs inside an OCR pool thread (so the thread-local pass marker is readable here)."""
+    data = multi_pass_20x_ocr(image_bytes)
+    return data, getattr(_tl, "last_pass", None)
 
+
+def _warmup_task(barrier: threading.Barrier):
+    try:
+        img = Image.new("RGB", (320, 320), "white")
+        buf = io.BytesIO()
+        img.save(buf, format="JPEG")
+        get_engine()(buf.getvalue())
+    except Exception:
+        log.debug("warm-up OCR failed (non-fatal)", exc_info=True)
+    try:
+        barrier.wait(timeout=180)
+    except threading.BrokenBarrierError:
+        pass
+
+
+async def warm_up_engines():
+    log.info("Warming up %d OCR worker(s) x %d ONNX thread(s)...", OCR_WORKERS, OCR_THREADS)
+    t0 = time.perf_counter()
+    loop = asyncio.get_running_loop()
+    barrier = threading.Barrier(OCR_WORKERS)
+    await asyncio.gather(*[loop.run_in_executor(OCR_POOL, _warmup_task, barrier) for _ in range(OCR_WORKERS)])
+    log.info("OCR engines ready in %.1fs", time.perf_counter() - t0)
+
+
+# ----------------------------------------------------------------- Database helpers
 def is_admin(uid: int) -> bool:
     return uid == ADMIN_ID
 
+
+_MEMBER_CACHE: dict[int, tuple[float, dict]] = {}
+_MEMBER_TTL = 60.0
+
+
 async def get_member(uid: int):
+    cached = _MEMBER_CACHE.get(uid)
+    if cached and time.time() - cached[0] < _MEMBER_TTL:
+        return cached[1]
     res = await run_db(lambda: db.table("team_members").select("*").eq("telegram_user_id", uid).eq("active", True).limit(1).execute())
-    return res.data[0] if res.data else None
+    member = res.data[0] if res.data else None
+    if member:
+        _MEMBER_CACHE[uid] = (time.time(), member)
+    else:
+        _MEMBER_CACHE.pop(uid, None)
+    return member
+
 
 async def get_daily_count(member_id: str) -> int:
     today_iso = now_local().date().isoformat()
@@ -645,12 +801,324 @@ async def get_daily_count(member_id: str) -> int:
     data = res.data[0] if isinstance(res.data, list) else res.data
     return int(data.get("email_count", 0)) if data else 0
 
+
 def _fmt(val):
     return val if val is not None else "—"
+
+
+def short_err(exc: Exception) -> str:
+    """Compact, readable error text (no giant HTML bodies)."""
+    text = re.sub(r"<[^>]+>", " ", str(exc))
+    text = re.sub(r"\\\\r\\\\n|\\r\\n|\s+", " ", text).strip()
+    return text[:160]
+
 
 async def reply(update: Update, text: str):
     if update.effective_message:
         await update.effective_message.reply_text(text)
+
+
+# ----------------------------------------------------------------- Telegram helpers
+async def tg_call(fn, *args, retries: int = 5, **kwargs):
+    """Calls a Telegram API method, waiting out flood limits and retrying network blips."""
+    for attempt in range(retries):
+        try:
+            return await fn(*args, **kwargs)
+        except RetryAfter as exc:
+            wait = exc.retry_after
+            wait = wait.total_seconds() if hasattr(wait, "total_seconds") else float(wait)
+            log.warning("Telegram flood limit, sleeping %.1fs", wait)
+            await asyncio.sleep(wait + 0.5)
+        except (TimedOut, NetworkError) as exc:
+            log.warning("Telegram network issue (%s), retry %d/%d", exc, attempt + 1, retries)
+            await asyncio.sleep(1 + attempt)
+    return await fn(*args, **kwargs)
+
+
+async def safe_edit(msg, text: str):
+    try:
+        await tg_call(msg.edit_text, text)
+    except BadRequest as exc:
+        if "not modified" not in str(exc).lower():
+            log.debug("edit failed: %s", exc)
+    except Exception:
+        log.debug("edit failed", exc_info=True)
+
+
+def fmt_secs(s: float) -> str:
+    s = int(max(0, s))
+    return f"{s // 60:02d}:{s % 60:02d}"
+
+
+# ----------------------------------------------------------------- Bulk queue
+@dataclass
+class Batch:
+    chat_id: int
+    started: float
+    total: int = 0
+    done: int = 0
+    sent: int = 0
+    new: int = 0
+    dup: int = 0
+    no_email: int = 0
+    failed: int = 0
+    lines: list = field(default_factory=list)
+    running: dict = field(default_factory=dict)
+    progress_msg: object = None
+    last_added: float = 0.0
+    finished: bool = False
+    watcher: object = None
+
+
+@dataclass
+class Job:
+    batch: Batch
+    member: dict
+    message: object
+    file_id: str
+    seq: int
+    queued_at: float
+    status: str = "failed"
+    err: str = ""
+    email: str | None = None
+    extracted: dict = field(default_factory=dict)
+    count: object = None
+    t: dict = field(default_factory=lambda: {"dl": 0.0, "ocr": 0.0, "db": 0.0, "wait": 0.0, "total": 0.0, "pass": None})
+
+
+BATCHES: dict[int, Batch] = {}
+
+
+async def process_job(bot, job: Job) -> None:
+    member, msg = job.member, job.message
+    loop = asyncio.get_running_loop()
+
+    # 1. download
+    t = time.perf_counter()
+    tg_file = await tg_call(bot.get_file, job.file_id)
+    raw_bytes = bytes(await tg_call(tg_file.download_as_bytearray))
+    job.t["dl"] = time.perf_counter() - t
+
+    # 2. OCR
+    t = time.perf_counter()
+    extracted, used_pass = await loop.run_in_executor(OCR_POOL, ocr_task, raw_bytes)
+    job.t["ocr"] = time.perf_counter() - t
+    job.t["pass"] = used_pass
+    job.extracted = extracted
+    email = extracted.get("email")
+    job.email = email
+
+    # 3. database (thread-safe + retried via run_db)
+    t = time.perf_counter()
+    if not email:
+        log.info("No email found in screenshot #%d. Storing review record.", job.seq)
+        await run_db(lambda: db.table("creator_submissions").insert({
+            "team_member_id": member["id"],
+            "telegram_message_id": msg.message_id,
+            "status": "email_not_found",
+            "extracted_username": extracted.get("instagram_username"),
+            "extracted_data": {k: v for k, v in extracted.items() if k != "email"},
+        }).execute())
+        job.status = "email_not_found"
+        job.t["db"] = time.perf_counter() - t
+        return
+
+    rpc = await run_db(lambda: db.rpc("register_creator_lead", {
+        "p_email": email,
+        "p_username": extracted.get("instagram_username"),
+        "p_full_name": extracted.get("full_name") or "UNKNOWN",
+        "p_followers": extracted.get("followers"),
+        "p_following": extracted.get("following"),
+        "p_post_count": extracted.get("post_count"),
+        "p_location": extracted.get("location"),
+        "p_niche": extracted.get("niche"),
+        "p_bio": extracted.get("bio"),
+        "p_member_id": member["id"],
+    }).execute())
+
+    result = rpc.data[0] if isinstance(rpc.data, list) else rpc.data
+    if not result or not result.get("creator_id"):
+        raise RuntimeError("Database registration returned an empty payload.")
+
+    creator_id = result["creator_id"]
+    is_new = bool(result.get("is_new"))
+
+    await run_db(lambda: db.table("creator_submissions").insert({
+        "team_member_id": member["id"],
+        "creator_id": creator_id,
+        "telegram_message_id": msg.message_id,
+        "status": "new" if is_new else "duplicate",
+        "extracted_username": extracted.get("instagram_username"),
+        "extracted_email": email,
+    }).execute())
+
+    try:
+        job.count = await get_daily_count(str(member["id"]))
+    except Exception:
+        job.count = "?"
+
+    job.status = "new" if is_new else "duplicate"
+    job.t["db"] = time.perf_counter() - t
+
+
+def build_caption(job: Job) -> str:
+    b, ex, t = job.batch, job.extracted, job.t
+    head = {
+        "new": "✅ NEW UNIQUE EMAIL",
+        "duplicate": "⚠️ DUPLICATE EMAIL — NO EXTRA CREDIT",
+        "email_not_found": "❌ No public business email detected.",
+        "failed": "🛑 FAILED TO PROCESS",
+    }[job.status]
+
+    lines = [
+        f"{head}  (#{job.seq})",
+        f"📊 Batch: {b.done}/{b.total} done  |  ⏱ {t['total']:.1f}s",
+        "",
+    ]
+    if job.status == "failed":
+        lines.append(f"Error: {job.err}")
+    else:
+        if job.email:
+            lines.append(f"Email: {job.email}")
+        lines += [
+            f'Instagram: @{ex.get("instagram_username") or "not detected"}',
+            f'Name: {ex.get("full_name") or "UNKNOWN"}',
+            f'Posts: {_fmt(ex.get("post_count"))}',
+            f'Followers: {_fmt(ex.get("followers"))}',
+            f'Following: {_fmt(ex.get("following"))}',
+            f'Location: {ex.get("location") or "—"}',
+            f'Niche: {ex.get("niche") or "—"}',
+        ]
+        if job.status in ("new", "duplicate"):
+            lines += ["", f"Your unique emails today: {job.count}/{DAILY_TARGET}"]
+
+    pass_txt = f" (pass {t['pass']}/3)" if t.get("pass") else ""
+    lines += [
+        "",
+        f"🔧 queue {t['wait']:.1f}s · download {t['dl']:.1f}s · OCR {t['ocr']:.1f}s{pass_txt} · DB {t['db']:.1f}s",
+    ]
+    return "\n".join(lines)[:1020]
+
+
+def summary_line(job: Job) -> str:
+    ex, t = job.extracted, job.t
+    uname = ex.get("instagram_username") or "not detected"
+    if job.status == "failed":
+        return f"#{job.seq} 🛑 failed: {job.err}"
+    icon = {"new": "✅ NEW", "duplicate": "⚠️ DUP", "email_not_found": "❌ NO EMAIL"}[job.status]
+    return (f"#{job.seq} {icon} | {job.email or '—'} | @{uname} | "
+            f"{_fmt(ex.get('followers'))} followers | {ex.get('location') or '—'} | {t['total']:.1f}s")
+
+
+async def send_result(bot, job: Job, caption: str):
+    try:
+        await tg_call(job.message.reply_photo, photo=job.file_id, caption=caption)
+    except Exception:
+        log.debug("reply_photo failed, falling back to send_photo", exc_info=True)
+        await tg_call(bot.send_photo, chat_id=job.batch.chat_id, photo=job.file_id, caption=caption)
+
+
+async def queue_worker(app: Application, wid: int):
+    q: asyncio.Queue = app.bot_data["queue"]
+    bot = app.bot
+    while True:
+        job: Job = await q.get()
+        b = job.batch
+        started = time.perf_counter()
+        job.t["wait"] = time.time() - job.queued_at
+        b.running[job.seq] = time.time()
+        try:
+            await process_job(bot, job)
+        except Exception as exc:
+            log.exception("Processing failed for screenshot #%d", job.seq)
+            job.status = "failed"
+            job.err = short_err(exc)
+        finally:
+            job.t["total"] = time.perf_counter() - started
+            b.running.pop(job.seq, None)
+            b.done += 1
+            if job.status == "new":
+                b.new += 1
+            elif job.status == "duplicate":
+                b.dup += 1
+            elif job.status == "email_not_found":
+                b.no_email += 1
+            else:
+                b.failed += 1
+
+        try:
+            await send_result(bot, job, build_caption(job))
+        except Exception:
+            log.exception("Could not send result photo for #%d", job.seq)
+        b.lines.append((job.seq, summary_line(job)))
+        b.sent += 1
+        q.task_done()
+
+
+def progress_text(b: Batch, final: bool = False) -> str:
+    now = time.time()
+    elapsed = now - b.started
+    total = max(b.total, 1)
+    filled = int(10 * b.done / total)
+    bar = "█" * filled + "░" * (10 - filled)
+    running = sorted(b.running.items())
+    running_txt = ", ".join(f"#{s} ({now - t0:.0f}s)" for s, t0 in running[:6]) or "—"
+    waiting = max(0, b.total - b.done - len(b.running))
+
+    timing = f"⏱ Elapsed {fmt_secs(elapsed)}"
+    if b.done:
+        avg = elapsed / b.done
+        timing += f" | Avg {avg:.1f}s/img"
+        if not final and b.done < b.total:
+            timing += f" | ETA ~{fmt_secs(avg * (b.total - b.done))}"
+
+    title = "🏁 Batch complete" if final else "⚙️ Processing batch"
+    text = (
+        f"{title}\n"
+        f"{bar} {b.done}/{b.total}\n\n"
+        f"✅ New: {b.new} | ⚠️ Dup: {b.dup} | ❌ No email: {b.no_email} | 🛑 Failed: {b.failed}\n"
+    )
+    if not final:
+        text += f"🔄 Running now: {running_txt}\n⏳ Waiting in queue: {waiting}\n"
+    text += f"{timing}\n🧵 Parallel workers: {OCR_WORKERS}"
+    return text
+
+
+async def batch_watcher(bot, member: dict, b: Batch):
+    """One per batch: keeps a live progress message and sends the final summary."""
+    try:
+        b.progress_msg = await tg_call(bot.send_message, b.chat_id, progress_text(b))
+    except Exception:
+        log.exception("Could not send progress message")
+
+    last_text = ""
+    while True:
+        await asyncio.sleep(PROGRESS_EVERY)
+        if b.sent >= b.total and time.time() - b.last_added >= BATCH_IDLE_SECS:
+            b.finished = True
+            break
+        text = progress_text(b)
+        if b.progress_msg and text != last_text:
+            last_text = text
+            await safe_edit(b.progress_msg, text)
+
+    if b.progress_msg:
+        await safe_edit(b.progress_msg, progress_text(b, final=True))
+
+    try:
+        count = await get_daily_count(str(member["id"]))
+    except Exception:
+        count = "?"
+
+    header = (
+        f"🏁 Done: {b.total} screenshots in {fmt_secs(time.time() - b.started)}\n"
+        f"✅ New: {b.new} | ⚠️ Duplicate: {b.dup} | ❌ No email: {b.no_email} | 🛑 Failed: {b.failed}\n"
+        f"Your unique emails today: {count}/{DAILY_TARGET}\n\n"
+    )
+    body = "\n".join(line for _, line in sorted(b.lines))
+    text = header + body
+    for i in range(0, len(text), 3800):
+        await tg_call(bot.send_message, b.chat_id, text[i:i + 3800])
 
 
 # ----------------------------------------------------------------- Telegram Handlers
@@ -664,11 +1132,19 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "telegram_user_id": user.id, "telegram_username": user.username,
             "display_name": user.full_name or "Admin", "role": "admin", "active": True,
         }, on_conflict="telegram_user_id").execute())
-        await reply(update, "Registered as admin.\nSend an Instagram profile screenshot to extract leads.")
+        await reply(update, "Registered as admin.\nSend Instagram profile screenshots (one or many) to extract leads.")
     elif await get_member(user.id):
-        await reply(update, "You're registered. Send an Instagram profile screenshot.")
+        await reply(update, "You're registered. Send Instagram profile screenshots (one or many).")
     else:
         await reply(update, "You are not on the allowlist. Ask the admin to add you.")
+
+
+async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    if not user or not await get_member(user.id):
+        return
+    q: asyncio.Queue = context.application.bot_data["queue"]
+    await reply(update, f"🟢 Online\n🧵 Workers: {OCR_WORKERS} (x{OCR_THREADS} ONNX threads)\n🗄 DB concurrency: {DB_MAX_CONCURRENCY}\n📥 Queue: {q.qsize()}")
 
 
 async def process_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -677,91 +1153,32 @@ async def process_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     log.info("--- [NEW SCREENSHOT] from @%s (ID: %d) ---", user.username, user.id)
-    member = await get_member(user.id)
+    try:
+        member = await get_member(user.id)
+    except Exception:
+        log.exception("Member lookup failed")
+        await msg.reply_text("Temporary database error, please resend this screenshot.")
+        return
     if not member:
         log.warning("User %d is unauthorized.", user.id)
         await msg.reply_text("You are not registered. Ask the admin to add you.")
         return
 
-    photo = msg.photo[-1]
-    status = await msg.reply_text("⏳ [1/3] Downloading screenshot...")
-    try:
-        tg_file = await context.bot.get_file(photo.file_id)
-        raw_bytes = bytes(await tg_file.download_as_bytearray())
+    now = time.time()
+    batch = BATCHES.get(user.id)
+    if batch is None or batch.finished:
+        batch = Batch(chat_id=msg.chat_id, started=now)
+        BATCHES[user.id] = batch
+        batch.watcher = asyncio.create_task(batch_watcher(context.bot, member, batch))
 
-        await status.edit_text("🔍 [2/3] Analyzing with 20x Deep Engine...")
-        extracted = await asyncio.to_thread(multi_pass_20x_ocr, raw_bytes)
-        email = extracted.get("email")
-
-        await status.edit_text("💾 [3/3] Registering lead in Supabase...")
-        if not email:
-            log.info("No email found in screenshot. Storing review record.")
-            await run_db(lambda: db.table("creator_submissions").insert({
-                "team_member_id": member["id"],
-                "telegram_message_id": msg.message_id,
-                "status": "email_not_found",
-                "extracted_username": extracted.get("instagram_username"),
-                "extracted_data": {k: v for k, v in extracted.items() if k != "email"},
-            }).execute())
-
-            await status.edit_text(
-                "❌ No public business email detected.\n\n"
-                f'Instagram: @{extracted.get("instagram_username") or "not detected"}\n'
-                f'Name: {extracted.get("full_name") or "UNKNOWN"}\n'
-                f'Followers: {_fmt(extracted.get("followers"))} | Posts: {_fmt(extracted.get("post_count"))}'
-            )
-            return
-
-        rpc = await run_db(lambda: db.rpc("register_creator_lead", {
-            "p_email": email,
-            "p_username": extracted.get("instagram_username"),
-            "p_full_name": extracted.get("full_name") or "UNKNOWN",
-            "p_followers": extracted.get("followers"),
-            "p_following": extracted.get("following"),
-            "p_post_count": extracted.get("post_count"),
-            "p_location": extracted.get("location"),
-            "p_niche": extracted.get("niche"),
-            "p_bio": extracted.get("bio"),
-            "p_member_id": member["id"],
-        }).execute())
-
-        result = rpc.data[0] if isinstance(rpc.data, list) else rpc.data
-        if not result or not result.get("creator_id"):
-            raise RuntimeError("Database registration returned an empty payload.")
-
-        creator_id = result["creator_id"]
-        is_new = bool(result.get("is_new"))
-
-        await run_db(lambda: db.table("creator_submissions").insert({
-            "team_member_id": member["id"],
-            "creator_id": creator_id,
-            "telegram_message_id": msg.message_id,
-            "status": "new" if is_new else "duplicate",
-            "extracted_username": extracted.get("instagram_username"),
-            "extracted_email": email,
-        }).execute())
-
-        count = await get_daily_count(str(member["id"]))
-        label = "✅ NEW UNIQUE EMAIL" if is_new else "⚠️ DUPLICATE EMAIL — NO EXTRA CREDIT"
-
-        await status.edit_text(
-            f"{label}\n\n"
-            f"Email: {email}\n"
-            f'Instagram: @{extracted.get("instagram_username") or "not detected"}\n'
-            f'Name: {extracted.get("full_name") or "UNKNOWN"}\n'
-            f'Posts: {_fmt(extracted.get("post_count"))}\n'
-            f'Followers: {_fmt(extracted.get("followers"))}\n'
-            f'Following: {_fmt(extracted.get("following"))}\n'
-            f'Location: {extracted.get("location") or "—"}\n'
-            f'Niche: {extracted.get("niche") or "—"}\n\n'
-            f"Your unique emails today: {count}/{DAILY_TARGET}"
-        )
-    except Exception as exc:
-        log.exception("Processing failed")
-        await status.edit_text(f"❌ Failed to process screenshot: {exc}")
+    batch.total += 1
+    batch.last_added = now
+    job = Job(batch=batch, member=member, message=msg, file_id=msg.photo[-1].file_id,
+              seq=batch.total, queued_at=now)
+    await context.application.bot_data["queue"].put(job)
 
 
-# ----------------------------------------------------------------- Built-in Health Server
+# ----------------------------------------------------------------- Optional health server
 class HealthCheckHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
@@ -778,16 +1195,44 @@ def run_web_server():
     server.serve_forever()
 
 
-def main():
-    threading.Thread(target=run_web_server, daemon=True).start()
-    log.info("Render health check server started on port %s", os.getenv("PORT", 8080))
+async def post_init(app: Application):
+    app.bot_data["queue"] = asyncio.Queue()
+    _get_db_sem()  # create the semaphore inside the running loop
+    await warm_up_engines()
+    app.bot_data["workers"] = [
+        asyncio.create_task(queue_worker(app, i)) for i in range(OCR_WORKERS + IO_EXTRA_WORKERS)
+    ]
+    log.info("Started %d queue workers (%d parallel OCR slots, DB concurrency %d)",
+             OCR_WORKERS + IO_EXTRA_WORKERS, OCR_WORKERS, DB_MAX_CONCURRENCY)
 
-    req = HTTPXRequest(connection_pool_size=16, connect_timeout=30.0, read_timeout=60.0)
-    app = Application.builder().token(BOT_TOKEN).request(req).build()
+
+async def post_shutdown(app: Application):
+    for w in app.bot_data.get("workers", []):
+        w.cancel()
+    OCR_POOL.shutdown(wait=False, cancel_futures=True)
+
+
+def main():
+    if os.getenv("RUN_HEALTH_SERVER", "0") == "1":
+        threading.Thread(target=run_web_server, daemon=True).start()
+        log.info("Health check server started on port %s", os.getenv("PORT", 8080))
+
+    req = HTTPXRequest(connection_pool_size=32, connect_timeout=30.0, read_timeout=60.0,
+                       write_timeout=60.0, pool_timeout=30.0)
+    app = (
+        Application.builder()
+        .token(BOT_TOKEN)
+        .request(req)
+        .concurrent_updates(True)
+        .post_init(post_init)
+        .post_shutdown(post_shutdown)
+        .build()
+    )
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("status", status_cmd))
     app.add_handler(MessageHandler(filters.PHOTO, process_photo))
 
-    log.info("Starting Telegram bot with 20x Deep RapidOCR engine")
+    log.info("Starting Telegram bot with 20x Deep RapidOCR engine (parallel bulk mode)")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
