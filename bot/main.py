@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import asyncio
+from http.server import BaseHTTPRequestHandler, HTTPServer
 import io
 import logging
 import os
 import re
+import threading
 import time
 from datetime import datetime
 from zoneinfo import ZoneInfo
@@ -764,7 +766,28 @@ async def process_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await status.edit_text(f"❌ Failed to process screenshot: {exc}")
 
 
+# ----------------------------------------------------------------- Built-in Health Server
+class HealthCheckHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"Bot is running!")
+
+    def log_message(self, format, *args):
+        pass  # Silence web server access logs in console
+
+
+def run_web_server():
+    port = int(os.getenv("PORT", 8080))
+    server = HTTPServer(("0.0.0.0", port), HealthCheckHandler)
+    server.serve_forever()
+
+
 def main():
+    # Start background port listener for Render Free Web Service
+    threading.Thread(target=run_web_server, daemon=True).start()
+    log.info("Render health check server started on port %s", os.getenv("PORT", 8080))
+
     req = HTTPXRequest(connection_pool_size=16, connect_timeout=30.0, read_timeout=60.0)
     app = Application.builder().token(BOT_TOKEN).request(req).build()
     app.add_handler(CommandHandler("start", start))
