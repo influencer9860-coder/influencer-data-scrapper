@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import gc
 from http.server import BaseHTTPRequestHandler, HTTPServer
 import io
 import logging
@@ -177,7 +178,6 @@ NICHE_RULES = {
     ),
 }
 
-# Standard internet TLD validator
 VALID_TLD_RE = re.compile(
     r"\.(com|in|co\.in|org|net|io|ai|me|co|app|agency|media|info|biz|tech|store|xyz|live|tv|uk|us|ca|ae|de|fr|global)$",
     re.I
@@ -232,7 +232,6 @@ class EmailEngine:
         if not raw_candidate or "@" not in raw_candidate:
             return None
 
-        # Clean punctuation and cuts
         candidate = re.split(r"\.{2,}|…", raw_candidate)[0]
         candidate = re.sub(r"(?i)(\.(?:com|in|co\.in|org|net|io|ai|me|co|app|agency|media))(?:\s*(?:and\s*\d+\s*more|more).*)$", r"\1", candidate)
         candidate = candidate.replace("(at)", "@").replace("[at]", "@")
@@ -248,23 +247,19 @@ class EmailEngine:
 
         local_part, domain = email.split("@", 1)
 
-        # 1. Strip call-to-action prefixes with separators
         local_part = re.sub(
             r"(?i)^.*?(?:collabs?|collaborat(?:e|ions?)|paid|pr|work|business|biz|enquir(?:y|ies)|queries|query|bookings?|email|mail|dm|contact|reach|connect|for)[-_:/|~]+\s*",
             "", local_part
         )
         local_part = re.sub(r"^[^a-z0-9]+", "", local_part)
 
-        # 2. Fix typos in domain
         if domain in DOMAIN_TYPOS:
             domain = DOMAIN_TYPOS[domain]
 
-        # 3. Reject invalid domain extensions (e.g. .preparoo is not a valid TLD)
         if not VALID_TLD_RE.search(domain):
             log.debug("  [REJECT INVALID TLD] '%s' is not an internet domain.", domain)
             return None
 
-        # 4. Length checks
         if domain in {"gmail.com", "googlemail.com"} and len(local_part) < 6:
             return None
         if len(local_part) < 2:
@@ -274,7 +269,6 @@ class EmailEngine:
         try:
             return validate_email(repaired_email, check_deliverability=True).normalized.lower()
         except EmailNotValidError:
-            # Only keep if deliverability check failed due to transient timeout on a valid TLD
             if VALID_TLD_RE.search(domain) and re.fullmatch(r"^[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}$", repaired_email):
                 return repaired_email
             return None
@@ -301,25 +295,21 @@ class GeoLocator:
         clean_sentence = " ".join(tokens)
         clean_lower = clean_sentence.lower()
 
-        # Strategy 1: Indian Cities
         for city_key, canonical in INDIAN_CITIES.items():
             if re.search(r"(?i)(?:^|\s|[pP90oOqQ\W_])(" + re.escape(city_key) + r")(?:$|\s|[\W_]|l|I)", clean_lower):
                 log.info("  [GEO ENGINE] Matched Indian City '%s' -> %s", city_key, canonical)
                 return canonical
 
-        # Strategy 2: Airport IATA Codes
         for code, canonical in IATA_AIRPORT_CODES.items():
             if re.search(r"(?i)(?:^|\s)" + re.escape(code) + r"(?:$|\s)", clean_sentence):
                 log.info("  [GEO ENGINE] Matched IATA Code '%s' -> %s", code, canonical)
                 return canonical
 
-        # Strategy 3: Global Metro Hubs
         for glob_key, canonical in GLOBAL_LOCATIONS.items():
             if re.search(r"(?i)(?:^|\s|[pP90oOqQ\W_])(" + re.escape(glob_key) + r")(?:$|\s|[\W_])", clean_lower):
                 log.info("  [GEO ENGINE] Matched Global Hub '%s' -> %s", glob_key, canonical)
                 return canonical
 
-        # Strategy 4: Indian States
         for state_key, canonical in INDIAN_STATES.items():
             if re.search(r"(?i)(?:^|\s)" + re.escape(state_key) + r"(?:$|\s)", clean_lower):
                 log.info("  [GEO ENGINE] Matched Indian State '%s' -> %s", state_key, canonical)
@@ -380,13 +370,11 @@ def _extract_from_boxes(boxes_data: list, full_w: int, full_h: int) -> dict:
             "w": max(1.0, x2 - x1) / full_w,
         })
 
-    # Cut off status bar
     filtered_items = [
         it for it in items
         if it["cy"] >= 0.045 and not re.fullmatch(r"\d{1,2}:\d{2}", it["text"].strip())
     ]
 
-    # Find bottom boundary ('Follow' / 'Message' buttons)
     button_y = 0.55
     action_buttons = [
         it["cy"] for it in filtered_items
@@ -397,7 +385,7 @@ def _extract_from_boxes(boxes_data: list, full_w: int, full_h: int) -> dict:
 
     profile_items = [it for it in filtered_items if it["cy"] <= button_y]
 
-    # --- 1. USERNAME (Top Header Bar) ---
+    # --- 1. USERNAME ---
     blocked = {"instagram", "threads", "follow", "message", "posts", "followers", "following"}
     username = None
     header_candidates = []
@@ -406,7 +394,6 @@ def _extract_from_boxes(boxes_data: list, full_w: int, full_h: int) -> dict:
         if 0.048 <= it["cy"] <= 0.140:
             clean_line = re.sub(r"[<«‹>»…•·*✓✔]+", " ", it["text"])
             for tok in clean_line.split():
-                # Clean punctuation without stripping underscores
                 t = re.sub(r"^[^a-zA-Z0-9_]+", "", tok)
                 t = re.sub(r"[^a-zA-Z0-9_]+$", "", t)
                 if len(t) >= 2 and HANDLE_RE.fullmatch(t) and re.search(r"[A-Za-z]", t) and t.lower() not in blocked:
@@ -485,7 +472,6 @@ def _extract_from_boxes(boxes_data: list, full_w: int, full_h: int) -> dict:
     raw_name = min(name_candidates)[1] if name_candidates else "UNKNOWN"
     full_name, extra_tag = clean_display_name(raw_name)
 
-    # Subtitle Category detector
     category_subtitle = None
     sub_candidates = [
         it["text"].strip() for it in profile_items
@@ -500,20 +486,15 @@ def _extract_from_boxes(boxes_data: list, full_w: int, full_h: int) -> dict:
     all_lines = [it["text"] for it in profile_items]
     full_text = " \n ".join(all_lines)
 
-    # Email Candidate Priority Scoring
     email_candidates = []
     email_indicator_pattern = re.compile(r"(?:✉|📧|📩|email|mail|contact|collab|queries|pr)", re.I)
 
     for line in all_lines:
         has_indicator = bool(email_indicator_pattern.search(line))
-
-        # Do NOT strip space before @ if preceded by words (prevents 'building @fin.preparoo' -> 'building@fin.preparoo')
-        # Only collapse spaces AFTER @ for fragmented domains (e.g. 'devraj@ kineticmgmt.in' -> 'devraj@kineticmgmt.in')
         norm = re.sub(r"@\s+", "@", line)
         norm = re.sub(r"([a-zA-Z0-9_.-]+)\s*\.\s*([a-zA-Z0-9_.-]+)", r"\1.\2", norm)
 
         for token in norm.split():
-            # If token starts with '@' (e.g. '@fin.preparoo', '@nutrabay'), it's an Instagram handle, NOT an email
             if token.startswith("@"):
                 continue
 
@@ -525,7 +506,6 @@ def _extract_from_boxes(boxes_data: list, full_w: int, full_h: int) -> dict:
                 email_candidates.append((score, e))
                 log.info("  [EMAIL CANDIDATE] Found '%s' with score=%d (line: '%s')", e, score, line)
 
-    # Sort candidates by confidence score
     email = None
     if email_candidates:
         email_candidates.sort(key=lambda x: x[0], reverse=True)
@@ -559,40 +539,55 @@ def multi_pass_20x_ocr(image_bytes: bytes) -> dict:
     crop_frac = 0.62 if full_h / max(full_w, 1) > 1.5 else 1.0
     cropped = base_img.crop((0, 0, full_w, int(full_h * crop_frac)))
 
-    gray_stat = ImageOps.grayscale(cropped)
+    # CLAMP RESOLUTION FOR RENDER 512MB RAM ENVIRONMENT
+    # Mobile screenshots > 720px width exceed RAM when processed in full ONNX matrices.
+    target_ocr_width = 720
+    if cropped.width > target_ocr_width:
+        ocr_scale = target_ocr_width / float(cropped.width)
+        target_ocr_height = int(cropped.height * ocr_scale)
+        work_img = cropped.resize((target_ocr_width, target_ocr_height), Image.Resampling.LANCZOS)
+        log.info("Optimized input for Render RAM: %dx%d -> %dx%d (scale: %.3f)", full_w, full_h, target_ocr_width, target_ocr_height, ocr_scale)
+    else:
+        ocr_scale = 1.0
+        work_img = cropped.copy()
+
+    gray_stat = ImageOps.grayscale(work_img)
     mean_brightness = np.array(gray_stat).mean()
     is_dark_mode = mean_brightness < 120.0
-    log.info("Screenshot analyzed: %dx%d. Brightness=%.1f (Dark Mode: %s)", full_w, full_h, mean_brightness, is_dark_mode)
+    log.info("Screenshot brightness=%.1f (Dark Mode: %s)", mean_brightness, is_dark_mode)
 
-    # --- PASS 1: Auto-Inverted Luminosity ---
+    def run_ocr_pass(img_to_run: Image.Image) -> list | None:
+        buf = io.BytesIO()
+        img_to_run.save(buf, format="JPEG", quality=90)
+        res, _ = engine(buf.getvalue())
+        if not res:
+            return None
+        # Project coordinates back to original full screenshot scale
+        unscaled_res = []
+        for b, t, c in res:
+            orig_box = [[p[0] / ocr_scale, p[1] / ocr_scale] for p in b]
+            unscaled_res.append((orig_box, t, c))
+        return unscaled_res
+
+    # --- PASS 1: Auto-Inverted High Contrast Scan ---
     log.info("=== [PASS 1/3] Auto-Inverted High Contrast Scan ===")
-    if is_dark_mode:
-        pass1_img = ImageOps.invert(cropped)
-    else:
-        pass1_img = cropped.copy()
+    pass1_img = ImageOps.invert(work_img) if is_dark_mode else work_img.copy()
     pass1_img = ImageOps.autocontrast(pass1_img, cutoff=1)
-    buf1 = io.BytesIO()
-    pass1_img.save(buf1, format="JPEG", quality=95)
-
-    res1, _ = engine(buf1.getvalue())
+    res1 = run_ocr_pass(pass1_img)
     data1 = _extract_from_boxes(res1, full_w, full_h) if res1 else None
+
     if data1 and data1["email"] and data1["instagram_username"] and data1["followers"] is not None:
         log.info("✅ Pass 1 extracted all primary fields successfully.")
+        gc.collect()
         return data1
 
-    # --- PASS 2: 1.5x Super-Resolution & Unsharp Mask ---
-    log.info("=== [PASS 2/3] 1.5x Super-Resolution + Unsharp Masking ===")
-    up_w, up_h = int(cropped.width * 1.5), int(cropped.height * 1.5)
-    pass2_img = cropped.resize((up_w, up_h), Image.Resampling.LANCZOS)
-    pass2_img = pass2_img.filter(ImageFilter.UnsharpMask(radius=2, percent=160, threshold=2))
+    # --- PASS 2: Sharpening & Enhanced Contrast (Memory Safe) ---
+    log.info("=== [PASS 2/3] Sharpening & Edge Boost ===")
+    pass2_img = work_img.filter(ImageFilter.UnsharpMask(radius=2, percent=150, threshold=2))
     pass2_img = ImageOps.autocontrast(pass2_img)
-    buf2 = io.BytesIO()
-    pass2_img.save(buf2, format="JPEG", quality=95)
-
-    res2, _ = engine(buf2.getvalue())
+    res2 = run_ocr_pass(pass2_img)
     if res2:
-        scaled_res2 = [([[p[0] / 1.5, p[1] / 1.5] for p in b], t, c) for b, t, c in res2]
-        data2 = _extract_from_boxes(scaled_res2, full_w, full_h)
+        data2 = _extract_from_boxes(res2, full_w, full_h)
         if data1:
             data2["email"] = data2["email"] or data1.get("email")
             data2["instagram_username"] = data2["instagram_username"] or data1.get("instagram_username")
@@ -602,18 +597,16 @@ def multi_pass_20x_ocr(image_bytes: bytes) -> dict:
             data2["niche"] = data2["niche"] or data1.get("niche")
         if data2["email"] and data2["instagram_username"]:
             log.info("✅ Pass 2 successfully completed recovery.")
+            gc.collect()
             return data2
     else:
         data2 = None
 
-    # --- PASS 3: CLAHE Dynamic Grayscale Fallback ---
+    # --- PASS 3: Grayscale Contrast Fallback ---
     log.info("=== [PASS 3/3] Dynamic Grayscale Contrast Fallback ===")
-    pass3_img = ImageOps.grayscale(cropped)
+    pass3_img = ImageOps.grayscale(work_img)
     pass3_img = ImageEnhance.Contrast(pass3_img).enhance(2.0)
-    buf3 = io.BytesIO()
-    pass3_img.save(buf3, format="JPEG", quality=95)
-
-    res3, _ = engine(buf3.getvalue())
+    res3 = run_ocr_pass(pass3_img)
     if res3:
         data3 = _extract_from_boxes(res3, full_w, full_h)
         best = data2 or data1
@@ -624,8 +617,10 @@ def multi_pass_20x_ocr(image_bytes: bytes) -> dict:
             data3["post_count"] = data3["post_count"] or best.get("post_count")
             data3["location"] = data3["location"] or best.get("location")
             data3["niche"] = data3["niche"] or best.get("niche")
+        gc.collect()
         return data3
 
+    gc.collect()
     return data2 or data1 or {
         "email": None, "instagram_username": None, "full_name": "UNKNOWN",
         "followers": None, "following": None, "post_count": None,
@@ -774,7 +769,7 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
         self.wfile.write(b"Bot is running!")
 
     def log_message(self, format, *args):
-        pass  # Silence web server access logs in console
+        pass
 
 
 def run_web_server():
@@ -784,7 +779,6 @@ def run_web_server():
 
 
 def main():
-    # Start background port listener for Render Free Web Service
     threading.Thread(target=run_web_server, daemon=True).start()
     log.info("Render health check server started on port %s", os.getenv("PORT", 8080))
 
