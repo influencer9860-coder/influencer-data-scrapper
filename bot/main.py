@@ -30,8 +30,11 @@ from telegram.request import HTTPXRequest
 
 load_dotenv()
 
+# -----------------------------------------------------------------------------
+# LOGGING CONFIGURATION
+# -----------------------------------------------------------------------------
 logging.basicConfig(
-    level=os.getenv("LOG_LEVEL", "DEBUG").upper(),
+    level=os.getenv("LOG_LEVEL", "INFO").upper(),
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
 logging.getLogger("httpx").setLevel(logging.WARNING)
@@ -47,16 +50,16 @@ DAILY_TARGET = int(os.getenv("DAILY_TARGET", "50"))
 MAX_IMAGE_MB = int(os.getenv("MAX_IMAGE_MB", "15"))
 ADMIN_ID = int(os.getenv("AUTHORIZED_USER_ID", "0"))
 
-# ----------------------------------------------------------------- Speed / bulk settings
+# Hardware & Concurrency Settings
 CPU_COUNT = os.cpu_count() or 4
 OCR_WORKERS = max(1, int(os.getenv("OCR_WORKERS", str(max(1, min(4, CPU_COUNT // 2))))))
 OCR_THREADS = max(1, int(os.getenv("OCR_THREADS", str(max(1, CPU_COUNT // OCR_WORKERS)))))
 IO_EXTRA_WORKERS = 2
 TARGET_OCR_WIDTH = int(os.getenv("OCR_WIDTH", "720"))
-PROGRESS_EVERY = float(os.getenv("PROGRESS_EVERY", "2.5"))
-BATCH_IDLE_SECS = float(os.getenv("BATCH_IDLE_SECS", "3"))
+PROGRESS_EVERY = float(os.getenv("PROGRESS_EVERY", "2.0"))
+BATCH_IDLE_SECS = float(os.getenv("BATCH_IDLE_SECS", "2.5"))
+BATCH_CHUNK_SIZE = int(os.getenv("BATCH_CHUNK_SIZE", "25"))  # Safe execution window
 
-# How many Supabase calls may run at the same time. 1 = fully safe (OCR is the real bottleneck anyway).
 DB_MAX_CONCURRENCY = max(1, int(os.getenv("DB_MAX_CONCURRENCY", "1")))
 DB_RETRIES = max(1, int(os.getenv("DB_RETRIES", "5")))
 
@@ -68,10 +71,9 @@ except Exception as exc:
 if not all([SUPABASE_URL, SUPABASE_KEY, BOT_TOKEN]) or ADMIN_ID <= 0:
     raise SystemExit("Missing required .env settings: SUPABASE_URL, SUPABASE_KEY, TELEGRAM_BOT_TOKEN, AUTHORIZED_USER_ID")
 
-# ----------------------------------------------------------------- Thread-safe Supabase access
-# ROOT CAUSE OF THE BULK FAILURES: the sync Supabase client (one httpx connection pool) was shared by many
-# threads via asyncio.to_thread. Concurrent use corrupts requests and the proxy answers "400 Bad Request".
-# FIX: every thread gets its own client, DB calls are limited by a semaphore, and transient errors are retried.
+# -----------------------------------------------------------------------------
+# THREAD-SAFE SUPABASE CONNECTION
+# -----------------------------------------------------------------------------
 log.info("Connecting to Supabase at %s", SUPABASE_URL)
 _db_local = threading.local()
 _db_generation = 0
@@ -79,7 +81,6 @@ _db_gen_lock = threading.Lock()
 
 
 def _bump_db_generation() -> None:
-    """Forces every thread to build a fresh client on its next call."""
     global _db_generation
     with _db_gen_lock:
         _db_generation += 1
@@ -95,14 +96,12 @@ def get_db():
 
 
 class _DBProxy:
-    """Drop-in replacement for the old global `db`: db.table(...) / db.rpc(...) use the calling thread's client."""
-
     def __getattr__(self, name):
         return getattr(get_db(), name)
 
 
 db = _DBProxy()
-get_db()  # fail fast on bad credentials
+get_db()
 
 _db_sem: asyncio.Semaphore | None = None
 
@@ -135,15 +134,17 @@ async def run_db(fn):
         except Exception as exc:
             last_exc = exc
             if attempt < DB_RETRIES - 1 and _is_transient_db_error(exc):
-                log.warning("DB call failed (attempt %d/%d): %s", attempt + 1, DB_RETRIES, str(exc)[:300])
+                log.warning("[DB RETRY %d/%d] Transient issue: %s", attempt + 1, DB_RETRIES, str(exc)[:200])
                 _bump_db_generation()
                 await asyncio.sleep(0.4 * (attempt + 1))
                 continue
             raise
-    raise last_exc  # pragma: no cover
+    raise last_exc
 
 
-# ----------------------------------------------------------------- OCR engines
+# -----------------------------------------------------------------------------
+# RAPIDOCR ENGINE INITIALIZER & WARMUP
+# -----------------------------------------------------------------------------
 _tl = threading.local()
 
 
@@ -157,7 +158,7 @@ def _make_engine():
 def get_engine():
     eng = getattr(_tl, "engine", None)
     if eng is None:
-        log.info("Loading 20x RapidOCR engine (ONNX Runtime) in thread %s...", threading.current_thread().name)
+        log.info("Loading RapidOCR engine (ONNX Runtime) in thread %s...", threading.current_thread().name)
         eng = _make_engine()
         _tl.engine = eng
         log.info("RapidOCR initialized successfully in thread %s.", threading.current_thread().name)
@@ -166,8 +167,32 @@ def get_engine():
 
 OCR_POOL = ThreadPoolExecutor(max_workers=OCR_WORKERS, thread_name_prefix="ocr", initializer=get_engine)
 
+
+def _warmup_task(barrier: threading.Barrier):
+    try:
+        img = Image.new("RGB", (320, 320), "white")
+        buf = io.BytesIO()
+        img.save(buf, format="JPEG")
+        get_engine()(buf.getvalue())
+    except Exception:
+        log.debug("Warm-up OCR failed (non-fatal)", exc_info=True)
+    try:
+        barrier.wait(timeout=180)
+    except threading.BrokenBarrierError:
+        pass
+
+
+async def warm_up_engines():
+    log.info("Warming up %d OCR worker(s) x %d ONNX thread(s)...", OCR_WORKERS, OCR_THREADS)
+    t0 = time.perf_counter()
+    loop = asyncio.get_running_loop()
+    barrier = threading.Barrier(OCR_WORKERS)
+    await asyncio.gather(*[loop.run_in_executor(OCR_POOL, _warmup_task, barrier) for _ in range(OCR_WORKERS)])
+    log.info("OCR engines ready in %.1fs", time.perf_counter() - t0)
+
+
 # -----------------------------------------------------------------------------
-# 20X TAXONOMY: LOCATIONS DATABASE
+# TAXONOMY DICTIONARIES
 # -----------------------------------------------------------------------------
 IATA_AIRPORT_CODES = {
     "DEL": "Delhi, India", "BOM": "Mumbai, India", "BLR": "Bengaluru, India",
@@ -210,23 +235,21 @@ INDIAN_CITIES = {
 }
 
 INDIAN_STATES = {
-    "maharashtra": "Maharashtra, India", "karnataka": "Karnataka, India",
-    "tamil nadu": "Tamil Nadu, India", "kerala": "Kerala, India",
-    "gujarat": "Gujarat, India", "rajasthan": "Rajasthan, India",
-    "punjab": "Punjab, India", "haryana": "Haryana, India",
-    "uttar pradesh": "Uttar Pradesh, India", "madhya pradesh": "Madhya Pradesh, India",
-    "bihar": "Bihar, India", "west bengal": "West Bengal, India",
-    "odisha": "Odisha, India", "assam": "Assam, India",
+    "odisha": "Odisha, India", "orissa": "Odisha, India", "maharashtra": "Maharashtra, India",
+    "karnataka": "Karnataka, India", "tamil nadu": "Tamil Nadu, India", "kerala": "Kerala, India",
+    "gujarat": "Gujarat, India", "rajasthan": "Rajasthan, India", "punjab": "Punjab, India",
+    "haryana": "Haryana, India", "uttar pradesh": "Uttar Pradesh, India", "madhya pradesh": "Madhya Pradesh, India",
+    "bihar": "Bihar, India", "west bengal": "West Bengal, India", "assam": "Assam, India",
     "himachal pradesh": "Himachal Pradesh, India", "uttarakhand": "Uttarakhand, India",
     "telangana": "Telangana, India", "andhra pradesh": "Andhra Pradesh, India",
     "goa": "Goa, India", "kashmir": "Jammu & Kashmir, India",
 }
 
 GLOBAL_LOCATIONS = {
-    "dubai": "Dubai, UAE", "abu dhabi": "Abu Dhabi, UAE", "sharjah": "Sharjah, UAE",
-    "london": "London, UK", "manchester": "Manchester, UK", "birmingham": "Birmingham, UK",
-    "new york": "New York, USA", "nyc": "New York, USA", "los angeles": "Los Angeles, USA",
-    "la": "Los Angeles, USA", "san francisco": "San Francisco, USA", "chicago": "Chicago, USA",
+    "chicago": "Chicago, USA", "cambridge": "Cambridge, UK", "london": "London, UK",
+    "manchester": "Manchester, UK", "dubai": "Dubai, UAE", "abu dhabi": "Abu Dhabi, UAE",
+    "sharjah": "Sharjah, UAE", "new york": "New York, USA", "nyc": "New York, USA",
+    "los angeles": "Los Angeles, USA", "la": "Los Angeles, USA", "san francisco": "San Francisco, USA",
     "toronto": "Toronto, Canada", "vancouver": "Vancouver, Canada", "singapore": "Singapore",
     "bali": "Bali, Indonesia", "sydney": "Sydney, Australia", "melbourne": "Melbourne, Australia",
 }
@@ -278,7 +301,7 @@ NICHE_RULES = {
         r"\b(dance|dancer|choreographer|choreography|zumba|classical\s*dance|hiphop)\b"
     ),
     "Art & Photography": (
-        r"\b(artist|art|painting|sketching|photographer|photography|filmmaker|cinematography|designer|design)\b"
+        r"\b(artist|art|painting|sketching|photographer|photography|filmmaker|cinematography|designer|design|architect)\b"
     ),
     "Modeling & Editorial": (
         r"\b(model|modeling|editorial|runway|pageant|commercial\s*model|photoshoots?)\b"
@@ -288,9 +311,35 @@ NICHE_RULES = {
     ),
 }
 
+# Complete Unicode Emoji and Dingbat Filter
+EMOJI_PATTERN = re.compile(
+    "["
+    "\U0001F1E0-\U0001F1FF"
+    "\U0001F300-\U0001F5FF"
+    "\U0001F600-\U0001F64F"
+    "\U0001F680-\U0001F6FF"
+    "\U0001F700-\U0001F77F"
+    "\U0001F780-\U0001F7FF"
+    "\U0001F800-\U0001F8FF"
+    "\U0001F900-\U0001F9FF"
+    "\U0001FA00-\U0001FA6F"
+    "\U0001FA70-\U0001FAFF"
+    "\U00002702-\U000027B0"
+    "\U000024C2-\U0001F251"
+    "\u2600-\u27BF"
+    "\uFE0E-\uFE0F"
+    "\u200D"
+    "]+",
+    flags=re.UNICODE,
+)
+
+PRONOUN_RE = re.compile(
+    r"(?i)\b(?:she|he|they|her|him|them|his|hers|its|xe|ze)\s*/\s*(?:she|he|they|her|him|them|his|hers|its|xe|ze)(?:\s*/\s*\w+)?\b"
+)
+
 VALID_TLD_RE = re.compile(
     r"\.(com|in|co\.in|org|net|io|ai|me|co|app|agency|media|info|biz|tech|store|xyz|live|tv|uk|us|ca|ae|de|fr|global)$",
-    re.I
+    re.I,
 )
 
 EMAIL_RE = re.compile(r"(?i)(?<![A-Z0-9._%+-])[A-Z0-9][A-Z0-9._%+-]*@[A-Z0-9.-]+\.[A-Z]{2,}(?![A-Z0-9.-])")
@@ -299,17 +348,44 @@ COUNT_TOKEN_RE = re.compile(r"(?i)(?<![A-Za-z0-9])([0-9][0-9,.]*\s*[KMB]?)(?![A-
 NUM_ONLY_RE = re.compile(r"^[0-9][0-9,.\s]*[KMBkmb]?$")
 
 DOMAIN_TYPOS = {
-    "gmai.com": "gmail.com",
-    "gmial.com": "gmail.com",
-    "gamil.com": "gmail.com",
-    "gmaill.com": "gmail.com",
-    "gmai1.com": "gmail.com",
-    "yaho.com": "yahoo.com",
-    "yahou.com": "yahoo.com",
-    "outlok.com": "outlook.com",
-    "hotmial.com": "hotmail.com",
-    "icld.com": "icloud.com",
+    "gmai.com": "gmail.com", "gmial.com": "gmail.com", "gamil.com": "gmail.com",
+    "gmaill.com": "gmail.com", "gmai1.com": "gmail.com", "yaho.com": "yahoo.com",
+    "yahou.com": "yahoo.com", "outlok.com": "outlook.com", "hotmial.com": "hotmail.com", "icld.com": "icloud.com",
 }
+
+PROVIDER_DOMAINS = sorted(
+    [
+        "gmail.com", "googlemail.com", "yahoo.com", "yahoo.in", "yahoo.co.in", "outlook.com",
+        "hotmail.com", "icloud.com", "live.com", "rediffmail.com", "proton.me", "protonmail.com", "me.com",
+    ],
+    key=len,
+    reverse=True,
+)
+_TRIM_CHARS = "<>()[]{}.,;:!?'\"-–—|•·¦/\u2502\u2503 "
+
+
+def repair_missing_at(token: str) -> str | None:
+    if not token or "@" in token:
+        return None
+    t = token.strip(_TRIM_CHARS)
+    low = t.lower()
+    for dom in PROVIDER_DOMAINS:
+        if not low.endswith(dom):
+            continue
+        local = t[: -len(dom)]
+        if len(local) < 3:
+            continue
+        last, prev = local[-1], local[-2]
+        junk_symbol = (not last.isalnum()) and last not in "._-"
+        junk_capital = last.isupper() and (prev.islower() or prev.isdigit())
+        junk_six = last == "6" and (prev.isalnum() or prev in "._")
+        if (junk_symbol or junk_capital or junk_six) and len(local) - 1 >= 3:
+            local = local[:-1]
+        local = local.rstrip("._-")
+        if len(local) < 2:
+            continue
+        return f"{local}@{dom}"
+    return None
 
 
 def now_local() -> datetime:
@@ -337,40 +413,91 @@ def parse_count(value: str | None) -> int | None:
         return None
 
 
+# ----------------------------------------------------------------- Entity Extraction
+def clean_display_name(raw_name: str) -> tuple[str, str | None]:
+    """Cleans emojis, bio subtitles, underscores, trailing quotes, and clamps to max 2 words."""
+    clean = EMOJI_PATTERN.sub(" ", raw_name)
+    clean = PRONOUN_RE.sub(" ", clean)
+    clean = re.sub(r"('s)([A-Za-z])", r"\1 \2", clean)
+
+    # Split on subtitle delimiters
+    parts = re.split(r"\s*[|•·/–—\-~]\s*", clean.strip())
+    name_candidate = parts[0].strip()
+    tag = parts[1].strip() if len(parts) > 1 and len(parts[1].strip()) >= 3 else None
+
+    # Replace glued underscores: Bhargavi_Vegiraju -> Bhargavi Vegiraju
+    name_candidate = name_candidate.replace("_", " ")
+
+    # Strip OCR punctuation/quotes (like the trailing apostrophe in Purvi Khirani')
+    name_candidate = re.sub(r"[^A-Za-zÀ-ÿ\s'-]", " ", name_candidate)
+    name_candidate = re.sub(r"\s+", " ", name_candidate).strip(" '\"-–—*.,;:!?`")
+
+    # Split CamelCase if glued together by OCR
+    if " " not in name_candidate and len(re.findall(r"(?<=[a-z])(?=[A-Z])", name_candidate)) == 1:
+        name_candidate = re.sub(r"(?<=[a-z])(?=[A-Z])", " ", name_candidate)
+
+    # Strip trailing quotes from individual tokens
+    raw_words = [w.strip(" '\"-–—*.,;:!?`") for w in name_candidate.split()]
+    words = [w for w in raw_words if len(w) > 0]
+
+    # Enforce strict 2-word maximum
+    if len(words) > 2:
+        final_name = f"{words[0]} {words[1]}"
+    elif len(words) >= 1:
+        final_name = " ".join(words)
+    else:
+        final_name = "UNKNOWN"
+
+    return (final_name.title() if len(final_name) >= 2 else "UNKNOWN", tag)
+
+
 class EmailEngine:
-    # lru_cache: same token on pass 1/2/3 (or repeated across screenshots) skips the live DNS lookup.
     @staticmethod
-    @lru_cache(maxsize=4096)
-    def clean(raw_candidate: str) -> str | None:
+    def clean(raw_candidate: str, matched_username: str | None = None) -> str | None:
         if not raw_candidate or "@" not in raw_candidate:
             return None
 
         candidate = re.split(r"\.{2,}|…", raw_candidate)[0]
         candidate = re.sub(r"(?i)(\.(?:com|in|co\.in|org|net|io|ai|me|co|app|agency|media))(?:\s*(?:and\s*\d+\s*more|more).*)$", r"\1", candidate)
         candidate = candidate.replace("(at)", "@").replace("[at]", "@")
-        candidate = re.sub(r"\s+", "", candidate).strip("<>()[]{}.,;:!?'\"-–—|•·")
+        candidate = re.sub(r"\s+", "", candidate).strip(_TRIM_CHARS)
 
         match = EMAIL_RE.search(candidate)
         if not match:
             return None
 
-        email = match.group(0).lower().rstrip(".,;:-–—")
+        email = match.group(0).lower().rstrip(".,;:-–—|")
         if "@" not in email:
             return None
 
         local_part, domain = email.split("@", 1)
 
+        # 1. Strip common prefix words
         local_part = re.sub(
             r"(?i)^.*?(?:collabs?|collaborat(?:e|ions?)|paid|pr|work|business|biz|enquir(?:y|ies)|queries|query|bookings?|email|mail|dm|contact|reach|connect|for)[-_:/|~]+\s*",
             "", local_part
         )
+        # 2. Strip leading punctuation / symbols / envelope glyph remnants
+        local_part = re.sub(r"^[|¦!\\/:\-~._•·]+", "", local_part)
+
+        # 3. Strip OCR ghost prefix matching username (e.g. lyourbeautsquad -> yourbeautsquad)
+        if matched_username:
+            u_clean = re.sub(r"[._]", "", matched_username.lower())
+            if u_clean and len(u_clean) >= 4:
+                for prefix in ("l", "i", "1", "|", "¦", "•"):
+                    if local_part.startswith(prefix) and (
+                        local_part[len(prefix):].startswith(u_clean) or local_part[len(prefix):] == u_clean
+                    ):
+                        log.info("  [EMAIL SCRUB] Stripped ghost prefix '%s' matching @%s", prefix, matched_username)
+                        local_part = local_part[len(prefix):]
+                        break
+
         local_part = re.sub(r"^[^a-z0-9]+", "", local_part)
 
         if domain in DOMAIN_TYPOS:
             domain = DOMAIN_TYPOS[domain]
 
         if not VALID_TLD_RE.search(domain):
-            log.debug("  [REJECT INVALID TLD] '%s' is not an internet domain.", domain)
             return None
 
         if domain in {"gmail.com", "googlemail.com"} and len(local_part) < 6:
@@ -380,10 +507,8 @@ class EmailEngine:
 
         repaired_email = f"{local_part}@{domain}"
         try:
-            return validate_email(repaired_email, check_deliverability=True).normalized.lower()
+            return validate_email(repaired_email, check_deliverability=False).normalized.lower()
         except EmailNotValidError:
-            if VALID_TLD_RE.search(domain) and re.fullmatch(r"^[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}$", repaired_email):
-                return repaired_email
             return None
         except Exception:
             return repaired_email if "@" in repaired_email and "." in domain else None
@@ -391,44 +516,71 @@ class EmailEngine:
 
 class GeoLocator:
     @staticmethod
-    def _scrub_token(token: str) -> str:
-        t = re.sub(r"^[^a-zA-Z0-9]+", "", token)
+    def _clean_token(t: str) -> str:
+        t = re.sub(r"^[^a-zA-Z0-9]+", "", t)
         t = re.sub(r"[^a-zA-Z0-9]+$", "", t)
-        if len(t) > 4 and t[0] in "PpQq09Oo" and t[1].isupper():
+        if len(t) > 4 and t[0] in "PpQq09" and t[1].isupper():
             t = t[1:]
         return t
 
     @classmethod
-    def detect(cls, text: str) -> str | None:
-        if not text:
+    def detect(cls, bio_text: str) -> str | None:
+        """Strictly detects location from the bio section only. Never scans highlight circles or post grids."""
+        if not bio_text:
             return None
 
-        spaced_text = re.sub(r"[/|•·\n,–—~]+", " ", text)
-        tokens = [cls._scrub_token(t) for t in spaced_text.split() if cls._scrub_token(t)]
-        clean_sentence = " ".join(tokens)
-        clean_lower = clean_sentence.lower()
+        lines = bio_text.splitlines()
+        # High confidence: lines explicitly accompanied by pin or location keywords
+        pin_lines = [
+            l for l in lines
+            if any(marker in l for marker in ["📍", "📌", "location", "based in", "living in"])
+        ]
 
-        for city_key, canonical in INDIAN_CITIES.items():
-            if re.search(r"(?i)(?:^|\s|[pP90oOqQ\W_])(" + re.escape(city_key) + r")(?:$|\s|[\W_]|l|I)", clean_lower):
-                log.info("  [GEO ENGINE] Matched Indian City '%s' -> %s", city_key, canonical)
-                return canonical
+        def match_tables(target_text: str) -> str | None:
+            if not target_text:
+                return None
+            spaced = re.sub(r"[/|•·\n,–—~]+", " ", target_text)
+            cleaned = EMOJI_PATTERN.sub(" ", spaced)
+            tokens = [cls._clean_token(t) for t in cleaned.split() if cls._clean_token(t)]
+            clean_sentence = " ".join(tokens)
+            clean_lower = clean_sentence.lower()
 
-        for code, canonical in IATA_AIRPORT_CODES.items():
-            if re.search(r"(?i)(?:^|\s)" + re.escape(code) + r"(?:$|\s)", clean_sentence):
-                log.info("  [GEO ENGINE] Matched IATA Code '%s' -> %s", code, canonical)
-                return canonical
+            # Word boundary matching on Indian Cities
+            for city_key, canonical in INDIAN_CITIES.items():
+                if re.search(r"\b" + re.escape(city_key) + r"\b", clean_lower):
+                    return canonical
 
-        for glob_key, canonical in GLOBAL_LOCATIONS.items():
-            if re.search(r"(?i)(?:^|\s|[pP90oOqQ\W_])(" + re.escape(glob_key) + r")(?:$|\s|[\W_])", clean_lower):
-                log.info("  [GEO ENGINE] Matched Global Hub '%s' -> %s", glob_key, canonical)
-                return canonical
+            # Global Hubs (e.g., Chicago, London, Dubai)
+            for glob_key, canonical in GLOBAL_LOCATIONS.items():
+                if re.search(r"\b" + re.escape(glob_key) + r"\b", clean_lower):
+                    return canonical
 
-        for state_key, canonical in INDIAN_STATES.items():
-            if re.search(r"(?i)(?:^|\s)" + re.escape(state_key) + r"(?:$|\s)", clean_lower):
-                log.info("  [GEO ENGINE] Matched Indian State '%s' -> %s", state_key, canonical)
-                return canonical
+            # Indian States (e.g., Odisha, Maharashtra)
+            for state_key, canonical in INDIAN_STATES.items():
+                if re.search(r"\b" + re.escape(state_key) + r"\b", clean_lower):
+                    return canonical
 
-        return None
+            # IATA Codes
+            for code, canonical in IATA_AIRPORT_CODES.items():
+                if re.search(r"\b" + re.escape(code) + r"\b", clean_sentence):
+                    return canonical
+
+            # Glued names (e.g. WestBengal)
+            glued = re.sub(r"[^a-z]", "", clean_lower)
+            for table in (INDIAN_CITIES, GLOBAL_LOCATIONS, INDIAN_STATES):
+                for key, canonical in table.items():
+                    if " " in key and key.replace(" ", "") in glued:
+                        return canonical
+            return None
+
+        # Check pin lines first
+        if pin_lines:
+            pin_match = match_tables(" \n ".join(pin_lines))
+            if pin_match:
+                return pin_match
+
+        # Otherwise check the rest of the bio lines
+        return match_tables(bio_text)
 
 
 class NicheClassifier:
@@ -451,16 +603,35 @@ class NicheClassifier:
         return ", ".join(sorted(detected))
 
 
-def clean_display_name(raw_name: str) -> tuple[str, str | None]:
-    clean = re.sub(r"[\u2600-\u27BF\U0001f300-\U0001f64f\U0001f680-\U0001f6ff\U0001f900-\U0001f9ff]+", " ", raw_name)
-    clean = re.sub(r"('s)([A-Za-z])", r"\1 \2", clean)
+def _email_candidates_from_lines(all_lines: list[str], username: str | None = None) -> list[tuple[int, str]]:
+    candidates: list[tuple[int, str]] = []
+    email_indicator_pattern = re.compile(r"(?:✉|📧|📩|email|mail|contact|collab|queries|pr)", re.I)
 
-    parts = re.split(r"\s*[|•·/–—\-]\s*", clean.strip())
-    name = parts[0].strip()
-    tag = parts[1].strip() if len(parts) > 1 and len(parts[1].strip()) >= 3 else None
+    for line in all_lines:
+        has_indicator = bool(email_indicator_pattern.search(line))
+        norm = re.sub(r"[|¦•·/\\]", " ", line)
+        norm = re.sub(r"@\s+", "@", norm)
+        norm = re.sub(r"([a-zA-Z0-9_.-]+)\s*\.\s*([a-zA-Z0-9_.-]+)", r"\1.\2", norm)
 
-    name = re.sub(r"\s+", " ", name).strip()
-    return (name if len(name) >= 2 else "UNKNOWN", tag)
+        for token in norm.split():
+            if token.startswith("@"):
+                continue
+
+            tries = [(token, 0)]
+            if "@" not in token:
+                fixed = repair_missing_at(token)
+                if fixed:
+                    tries.append((fixed, 0))
+
+            for cand, bonus in tries:
+                e = EmailEngine.clean(cand, matched_username=username)
+                if e:
+                    score = (100 if has_indicator else 50) + bonus
+                    if any(provider in e for provider in ["gmail.com", "yahoo.com", "outlook.com", "hotmail.com", "icloud.com"]):
+                        score += 20
+                    candidates.append((score, e))
+                    break
+    return candidates
 
 
 def _extract_from_boxes(boxes_data: list, full_w: int, full_h: int) -> dict:
@@ -491,14 +662,15 @@ def _extract_from_boxes(boxes_data: list, full_w: int, full_h: int) -> dict:
     button_y = 0.55
     action_buttons = [
         it["cy"] for it in filtered_items
-        if it["text"].lower() in {"follow", "following", "message", "edit profile", "contact", "share profile"} and it["cy"] > 0.25
+        if it["text"].lower() in {"follow", "following", "message", "edit profile", "contact", "share profile", "subscribe"} and it["cy"] > 0.25
     ]
     if action_buttons:
         button_y = min(action_buttons) + 0.02
 
+    # Bio section items strictly above action buttons
     profile_items = [it for it in filtered_items if it["cy"] <= button_y]
 
-    # --- 1. USERNAME ---
+    # 1. USERNAME
     blocked = {"instagram", "threads", "follow", "message", "posts", "followers", "following"}
     username = None
     header_candidates = []
@@ -516,7 +688,7 @@ def _extract_from_boxes(boxes_data: list, full_w: int, full_h: int) -> dict:
         header_candidates.sort(key=lambda x: x[0], reverse=True)
         username = header_candidates[0][1]
 
-    # --- 2. STATS ---
+    # 2. STATS
     labels = {
         "post_count": (re.compile(r"^posts?$", re.I), re.compile(r"\bposts?\b", re.I)),
         "followers": (re.compile(r"^followers?$", re.I), re.compile(r"\bfollowers?\b", re.I)),
@@ -566,7 +738,7 @@ def _extract_from_boxes(boxes_data: list, full_w: int, full_h: int) -> dict:
             stats["followers"] = parse_count(stat_row_numbers[1]["text"])
             stats["following"] = parse_count(stat_row_numbers[2]["text"])
 
-    # --- 3. DISPLAY NAME ---
+    # 3. DISPLAY NAME (Max 2 words)
     name_candidates = []
     for it in profile_items:
         clean_text = it["text"].strip()
@@ -595,38 +767,21 @@ def _extract_from_boxes(boxes_data: list, full_w: int, full_h: int) -> dict:
             category_subtitle = sub
             break
 
-    # --- 4. BIO, EMAIL, LOCATION & NICHE ---
-    all_lines = [it["text"] for it in profile_items]
-    full_text = " \n ".join(all_lines)
+    # 4. BIO, EMAIL & LOCATION
+    all_image_lines = [it["text"] for it in filtered_items]
+    bio_lines = [it["text"] for it in profile_items]
+    full_bio_text = " \n ".join(bio_lines)
 
-    email_candidates = []
-    email_indicator_pattern = re.compile(r"(?:✉|📧|📩|email|mail|contact|collab|queries|pr)", re.I)
-
-    for line in all_lines:
-        has_indicator = bool(email_indicator_pattern.search(line))
-        norm = re.sub(r"@\s+", "@", line)
-        norm = re.sub(r"([a-zA-Z0-9_.-]+)\s*\.\s*([a-zA-Z0-9_.-]+)", r"\1.\2", norm)
-
-        for token in norm.split():
-            if token.startswith("@"):
-                continue
-
-            e = EmailEngine.clean(token)
-            if e:
-                score = 100 if has_indicator else 50
-                if any(provider in e for provider in ["gmail.com", "yahoo.com", "outlook.com", "hotmail.com", "icloud.com"]):
-                    score += 20
-                email_candidates.append((score, e))
-                log.info("  [EMAIL CANDIDATE] Found '%s' with score=%d (line: '%s')", e, score, line)
-
+    # Search email across all lines in the image (including Contact bottom modal)
+    email_candidates = _email_candidates_from_lines(all_image_lines, username=username)
     email = None
     if email_candidates:
         email_candidates.sort(key=lambda x: x[0], reverse=True)
         email = email_candidates[0][1]
-        log.info("  [EMAIL WINNER] Selected best email: %s", email)
 
-    location = GeoLocator.detect(full_text)
-    niche = NicheClassifier.detect(full_text, category_subtitle, extra_tag)
+    # LOCATION IS STRICTLY DETECTED FROM BIO ONLY (NEVER FROM HIGHLIGHTS OR REELS)
+    location = GeoLocator.detect(full_bio_text)
+    niche = NicheClassifier.detect(full_bio_text, category_subtitle, extra_tag)
 
     return {
         "email": email,
@@ -637,12 +792,24 @@ def _extract_from_boxes(boxes_data: list, full_w: int, full_h: int) -> dict:
         "post_count": stats["post_count"],
         "location": location,
         "niche": niche,
-        "bio": full_text[:800],
+        "bio": full_bio_text[:800],
     }
 
 
-def multi_pass_20x_ocr(image_bytes: bytes) -> dict:
-    _tl.last_pass = None  # debug only: which pass produced the final result
+def _merge_missing(dst: dict, src: dict | None) -> dict:
+    if not src:
+        return dst
+    for k in ("email", "instagram_username", "followers", "following", "post_count", "location", "niche"):
+        if dst.get(k) is None:
+            dst[k] = src.get(k)
+    if (not dst.get("full_name")) or dst.get("full_name") == "UNKNOWN":
+        dst["full_name"] = src.get("full_name") or dst.get("full_name")
+    return dst
+
+
+def multi_pass_20x_ocr(image_bytes: bytes, seq: int) -> dict:
+    _tl.last_pass = None
+    t0 = time.perf_counter()
 
     try:
         with Image.open(io.BytesIO(image_bytes)) as opened:
@@ -651,23 +818,21 @@ def multi_pass_20x_ocr(image_bytes: bytes) -> dict:
         raise ValueError("Invalid image file.") from exc
 
     full_w, full_h = base_img.size
-    crop_frac = 0.62 if full_h / max(full_w, 1) > 1.5 else 1.0
-    cropped = base_img.crop((0, 0, full_w, int(full_h * crop_frac)))
 
-    target_ocr_width = TARGET_OCR_WIDTH
-    if cropped.width > target_ocr_width:
-        ocr_scale = target_ocr_width / float(cropped.width)
-        target_ocr_height = int(cropped.height * ocr_scale)
-        work_img = cropped.resize((target_ocr_width, target_ocr_height), Image.Resampling.LANCZOS)
-        log.info("Optimized input: %dx%d -> %dx%d (scale: %.3f)", full_w, full_h, target_ocr_width, target_ocr_height, ocr_scale)
+    # Maintain full frame so bottom Contact drawers are readable
+    if full_w > TARGET_OCR_WIDTH:
+        ocr_scale = TARGET_OCR_WIDTH / float(full_w)
+        target_ocr_height = int(full_h * ocr_scale)
+        work_img = base_img.resize((TARGET_OCR_WIDTH, target_ocr_height), Image.Resampling.LANCZOS)
     else:
         ocr_scale = 1.0
-        work_img = cropped.copy()
+        work_img = base_img.copy()
 
     gray_stat = ImageOps.grayscale(work_img)
     mean_brightness = np.array(gray_stat).mean()
     is_dark_mode = mean_brightness < 120.0
-    log.info("Screenshot brightness=%.1f (Dark Mode: %s)", mean_brightness, is_dark_mode)
+    log.info("[JOB #%d] [STEP 2/5] [PREPROCESS] Mode: %s (Brightness: %.1f) | Scaled %dx%d -> %dx%d",
+             seq, "DarkMode" if is_dark_mode else "LightMode", mean_brightness, full_w, full_h, work_img.width, work_img.height)
 
     def run_ocr_pass(img_to_run: Image.Image) -> list | None:
         buf = io.BytesIO()
@@ -675,62 +840,49 @@ def multi_pass_20x_ocr(image_bytes: bytes) -> dict:
         res, _ = get_engine()(buf.getvalue())
         if not res:
             return None
-        unscaled_res = []
+        unscaled = []
         for b, t, c in res:
             orig_box = [[p[0] / ocr_scale, p[1] / ocr_scale] for p in b]
-            unscaled_res.append((orig_box, t, c))
-        return unscaled_res
+            unscaled.append((orig_box, t, c))
+        return unscaled
 
-    # --- PASS 1 ---
-    log.info("=== [PASS 1/3] Auto-Inverted High Contrast Scan ===")
+    # PASS 1: High Contrast
+    log.info("[JOB #%d] [STEP 3/5] [OCR-20X] Executing Pass 1/3 (High Contrast Inversion)...", seq)
     pass1_img = ImageOps.invert(work_img) if is_dark_mode else work_img.copy()
     pass1_img = ImageOps.autocontrast(pass1_img, cutoff=1)
     res1 = run_ocr_pass(pass1_img)
     data1 = _extract_from_boxes(res1, full_w, full_h) if res1 else None
 
     if data1 and data1["email"] and data1["instagram_username"] and data1["followers"] is not None:
-        log.info("✅ Pass 1 extracted all primary fields successfully.")
+        log.info("[JOB #%d] [STEP 3/5] [OCR-20X] Pass 1 completed recovery in %.2fs", seq, time.perf_counter() - t0)
         _tl.last_pass = 1
         gc.collect()
         return data1
 
-    # --- PASS 2 ---
-    log.info("=== [PASS 2/3] Sharpening & Edge Boost ===")
-    pass2_img = work_img.filter(ImageFilter.UnsharpMask(radius=2, percent=150, threshold=2))
+    # PASS 2: Edge Boost
+    log.info("[JOB #%d] [STEP 3/5] [OCR-20X] Executing Pass 2/3 (Edge Boost Fallback)...", seq)
+    pass2_img = ImageOps.invert(work_img) if is_dark_mode else work_img.copy()
+    pass2_img = pass2_img.filter(ImageFilter.UnsharpMask(radius=2, percent=150, threshold=2))
     pass2_img = ImageOps.autocontrast(pass2_img)
     res2 = run_ocr_pass(pass2_img)
+    data2 = None
     if res2:
-        data2 = _extract_from_boxes(res2, full_w, full_h)
-        if data1:
-            data2["email"] = data2["email"] or data1.get("email")
-            data2["instagram_username"] = data2["instagram_username"] or data1.get("instagram_username")
-            data2["followers"] = data2["followers"] or data1.get("followers")
-            data2["post_count"] = data2["post_count"] or data1.get("post_count")
-            data2["location"] = data2["location"] or data1.get("location")
-            data2["niche"] = data2["niche"] or data1.get("niche")
+        data2 = _merge_missing(_extract_from_boxes(res2, full_w, full_h), data1)
         if data2["email"] and data2["instagram_username"]:
-            log.info("✅ Pass 2 successfully completed recovery.")
+            log.info("[JOB #%d] [STEP 3/5] [OCR-20X] Pass 2 completed recovery in %.2fs", seq, time.perf_counter() - t0)
             _tl.last_pass = 2
             gc.collect()
             return data2
-    else:
-        data2 = None
 
-    # --- PASS 3 ---
-    log.info("=== [PASS 3/3] Dynamic Grayscale Contrast Fallback ===")
+    # PASS 3: Deep Grayscale Fallback
+    log.info("[JOB #%d] [STEP 3/5] [OCR-20X] Executing Pass 3/3 (Deep Grayscale Contrast)...", seq)
     pass3_img = ImageOps.grayscale(work_img)
+    if is_dark_mode:
+        pass3_img = ImageOps.invert(pass3_img)
     pass3_img = ImageEnhance.Contrast(pass3_img).enhance(2.0)
     res3 = run_ocr_pass(pass3_img)
     if res3:
-        data3 = _extract_from_boxes(res3, full_w, full_h)
-        best = data2 or data1
-        if best:
-            data3["email"] = data3["email"] or best.get("email")
-            data3["instagram_username"] = data3["instagram_username"] or best.get("instagram_username")
-            data3["followers"] = data3["followers"] or best.get("followers")
-            data3["post_count"] = data3["post_count"] or best.get("post_count")
-            data3["location"] = data3["location"] or best.get("location")
-            data3["niche"] = data3["niche"] or best.get("niche")
+        data3 = _merge_missing(_extract_from_boxes(res3, full_w, full_h), data2 or data1)
         _tl.last_pass = 3
         gc.collect()
         return data3
@@ -744,113 +896,12 @@ def multi_pass_20x_ocr(image_bytes: bytes) -> dict:
     }
 
 
-def ocr_task(image_bytes: bytes) -> tuple[dict, int | None]:
-    """Runs inside an OCR pool thread (so the thread-local pass marker is readable here)."""
-    data = multi_pass_20x_ocr(image_bytes)
+def ocr_task(image_bytes: bytes, seq: int) -> tuple[dict, int | None]:
+    data = multi_pass_20x_ocr(image_bytes, seq)
     return data, getattr(_tl, "last_pass", None)
 
 
-def _warmup_task(barrier: threading.Barrier):
-    try:
-        img = Image.new("RGB", (320, 320), "white")
-        buf = io.BytesIO()
-        img.save(buf, format="JPEG")
-        get_engine()(buf.getvalue())
-    except Exception:
-        log.debug("warm-up OCR failed (non-fatal)", exc_info=True)
-    try:
-        barrier.wait(timeout=180)
-    except threading.BrokenBarrierError:
-        pass
-
-
-async def warm_up_engines():
-    log.info("Warming up %d OCR worker(s) x %d ONNX thread(s)...", OCR_WORKERS, OCR_THREADS)
-    t0 = time.perf_counter()
-    loop = asyncio.get_running_loop()
-    barrier = threading.Barrier(OCR_WORKERS)
-    await asyncio.gather(*[loop.run_in_executor(OCR_POOL, _warmup_task, barrier) for _ in range(OCR_WORKERS)])
-    log.info("OCR engines ready in %.1fs", time.perf_counter() - t0)
-
-
-# ----------------------------------------------------------------- Database helpers
-def is_admin(uid: int) -> bool:
-    return uid == ADMIN_ID
-
-
-_MEMBER_CACHE: dict[int, tuple[float, dict]] = {}
-_MEMBER_TTL = 60.0
-
-
-async def get_member(uid: int):
-    cached = _MEMBER_CACHE.get(uid)
-    if cached and time.time() - cached[0] < _MEMBER_TTL:
-        return cached[1]
-    res = await run_db(lambda: db.table("team_members").select("*").eq("telegram_user_id", uid).eq("active", True).limit(1).execute())
-    member = res.data[0] if res.data else None
-    if member:
-        _MEMBER_CACHE[uid] = (time.time(), member)
-    else:
-        _MEMBER_CACHE.pop(uid, None)
-    return member
-
-
-async def get_daily_count(member_id: str) -> int:
-    today_iso = now_local().date().isoformat()
-    res = await run_db(lambda: db.rpc("get_member_daily_progress", {"p_member_id": member_id, "p_day": today_iso}).execute())
-    data = res.data[0] if isinstance(res.data, list) else res.data
-    return int(data.get("email_count", 0)) if data else 0
-
-
-def _fmt(val):
-    return val if val is not None else "—"
-
-
-def short_err(exc: Exception) -> str:
-    """Compact, readable error text (no giant HTML bodies)."""
-    text = re.sub(r"<[^>]+>", " ", str(exc))
-    text = re.sub(r"\\\\r\\\\n|\\r\\n|\s+", " ", text).strip()
-    return text[:160]
-
-
-async def reply(update: Update, text: str):
-    if update.effective_message:
-        await update.effective_message.reply_text(text)
-
-
-# ----------------------------------------------------------------- Telegram helpers
-async def tg_call(fn, *args, retries: int = 5, **kwargs):
-    """Calls a Telegram API method, waiting out flood limits and retrying network blips."""
-    for attempt in range(retries):
-        try:
-            return await fn(*args, **kwargs)
-        except RetryAfter as exc:
-            wait = exc.retry_after
-            wait = wait.total_seconds() if hasattr(wait, "total_seconds") else float(wait)
-            log.warning("Telegram flood limit, sleeping %.1fs", wait)
-            await asyncio.sleep(wait + 0.5)
-        except (TimedOut, NetworkError) as exc:
-            log.warning("Telegram network issue (%s), retry %d/%d", exc, attempt + 1, retries)
-            await asyncio.sleep(1 + attempt)
-    return await fn(*args, **kwargs)
-
-
-async def safe_edit(msg, text: str):
-    try:
-        await tg_call(msg.edit_text, text)
-    except BadRequest as exc:
-        if "not modified" not in str(exc).lower():
-            log.debug("edit failed: %s", exc)
-    except Exception:
-        log.debug("edit failed", exc_info=True)
-
-
-def fmt_secs(s: float) -> str:
-    s = int(max(0, s))
-    return f"{s // 60:02d}:{s % 60:02d}"
-
-
-# ----------------------------------------------------------------- Bulk queue
+# ----------------------------------------------------------------- Data Models
 @dataclass
 class Batch:
     chat_id: int
@@ -863,11 +914,13 @@ class Batch:
     no_email: int = 0
     failed: int = 0
     lines: list = field(default_factory=list)
+    failed_jobs: list = field(default_factory=list)
     running: dict = field(default_factory=dict)
     progress_msg: object = None
     last_added: float = 0.0
     finished: bool = False
-    watcher: object = None
+    pending_buffer: list = field(default_factory=list)
+    active_dispatched: int = 0
 
 
 @dataclass
@@ -893,25 +946,34 @@ async def process_job(bot, job: Job) -> None:
     member, msg = job.member, job.message
     loop = asyncio.get_running_loop()
 
-    # 1. download
+    # STEP 1: Download
+    log.info("[JOB #%d] [STEP 1/5] [DOWNLOAD] Downloading photo from Telegram CDN...", job.seq)
     t = time.perf_counter()
     tg_file = await tg_call(bot.get_file, job.file_id)
     raw_bytes = bytes(await tg_call(tg_file.download_as_bytearray))
     job.t["dl"] = time.perf_counter() - t
+    log.info("[JOB #%d] [STEP 1/5] [DOWNLOAD] Complete in %.2fs (%d KB)", job.seq, job.t["dl"], len(raw_bytes) // 1024)
 
-    # 2. OCR
+    # STEP 2 & 3: 20x RapidOCR Multi-Pass
     t = time.perf_counter()
-    extracted, used_pass = await loop.run_in_executor(OCR_POOL, ocr_task, raw_bytes)
+    extracted, used_pass = await loop.run_in_executor(OCR_POOL, ocr_task, raw_bytes, job.seq)
     job.t["ocr"] = time.perf_counter() - t
     job.t["pass"] = used_pass
     job.extracted = extracted
     email = extracted.get("email")
     job.email = email
 
-    # 3. database (thread-safe + retried via run_db)
+    # STEP 4: Entity Logging
+    log.info(
+        "[JOB #%d] [STEP 4/5] [ENTITIES] Email: '%s' | Handle: @%s | Name: '%s' | Location: %s | Niche: %s",
+        job.seq, email or "NOT_DETECTED", extracted.get("instagram_username") or "none",
+        extracted.get("full_name"), extracted.get("location") or "none", extracted.get("niche") or "none"
+    )
+
+    # STEP 5: Supabase Persistence
     t = time.perf_counter()
+    log.info("[JOB #%d] [STEP 5/5] [SUPABASE] Committing record to database...", job.seq)
     if not email:
-        log.info("No email found in screenshot #%d. Storing review record.", job.seq)
         await run_db(lambda: db.table("creator_submissions").insert({
             "team_member_id": member["id"],
             "telegram_message_id": msg.message_id,
@@ -959,21 +1021,22 @@ async def process_job(bot, job: Job) -> None:
 
     job.status = "new" if is_new else "duplicate"
     job.t["db"] = time.perf_counter() - t
+    log.info("[JOB #%d] [COMPLETED] Status: %s in %.2fs (OCR: %.2fs)", job.seq, job.status, time.perf_counter() - job.queued_at, job.t["ocr"])
 
 
 def build_caption(job: Job) -> str:
     b, ex, t = job.batch, job.extracted, job.t
-    head = {
-        "new": "✅ NEW UNIQUE EMAIL",
-        "duplicate": "⚠️ DUPLICATE EMAIL — NO EXTRA CREDIT",
-        "email_not_found": "❌ No public business email detected.",
-        "failed": "🛑 FAILED TO PROCESS",
+    status_header = {
+        "new": "✅ [STATUS: NEW UNIQUE LEAD]",
+        "duplicate": "⚠️ [STATUS: DUPLICATE LEAD]",
+        "email_not_found": "❌ [STATUS: NO BUSINESS EMAIL DETECTED]",
+        "failed": "🛑 [STATUS: FAILED TO PROCESS]",
     }[job.status]
 
     lines = [
-        f"{head}  (#{job.seq})",
-        f"📊 Batch: {b.done}/{b.total} done  |  ⏱ {t['total']:.1f}s",
-        "",
+        f"{status_header}  (#{job.seq})",
+        f"Batch: {b.done}/{b.total} processed | Time: {t['total']:.1f}s",
+        "----------------------------------------",
     ]
     if job.status == "failed":
         lines.append(f"Error: {job.err}")
@@ -981,40 +1044,38 @@ def build_caption(job: Job) -> str:
         if job.email:
             lines.append(f"Email: {job.email}")
         lines += [
-            f'Instagram: @{ex.get("instagram_username") or "not detected"}',
-            f'Name: {ex.get("full_name") or "UNKNOWN"}',
-            f'Posts: {_fmt(ex.get("post_count"))}',
-            f'Followers: {_fmt(ex.get("followers"))}',
-            f'Following: {_fmt(ex.get("following"))}',
-            f'Location: {ex.get("location") or "—"}',
-            f'Niche: {ex.get("niche") or "—"}',
+            f"Instagram: @{ex.get('instagram_username') or 'not detected'}",
+            f"Name: {ex.get('full_name') or 'UNKNOWN'}",
+            f"Posts: {_fmt(ex.get('post_count'))}",
+            f"Followers: {_fmt(ex.get('followers'))}",
+            f"Following: {_fmt(ex.get('following'))}",
+            f"Location: {ex.get('location') or '—'}",
+            f"Niche: {ex.get('niche') or '—'}",
         ]
         if job.status in ("new", "duplicate"):
-            lines += ["", f"Your unique emails today: {job.count}/{DAILY_TARGET}"]
+            lines += ["", f"Daily Score: {job.count}/{DAILY_TARGET} unique leads"]
 
     pass_txt = f" (pass {t['pass']}/3)" if t.get("pass") else ""
     lines += [
-        "",
-        f"🔧 queue {t['wait']:.1f}s · download {t['dl']:.1f}s · OCR {t['ocr']:.1f}s{pass_txt} · DB {t['db']:.1f}s",
+        "----------------------------------------",
+        f"Diagnostics: Wait {t['wait']:.1f}s | DL {t['dl']:.1f}s | OCR {t['ocr']:.1f}s{pass_txt} | DB {t['db']:.1f}s",
     ]
     return "\n".join(lines)[:1020]
 
 
 def summary_line(job: Job) -> str:
     ex, t = job.extracted, job.t
-    uname = ex.get("instagram_username") or "not detected"
+    uname = ex.get("instagram_username") or "none"
     if job.status == "failed":
-        return f"#{job.seq} 🛑 failed: {job.err}"
-    icon = {"new": "✅ NEW", "duplicate": "⚠️ DUP", "email_not_found": "❌ NO EMAIL"}[job.status]
-    return (f"#{job.seq} {icon} | {job.email or '—'} | @{uname} | "
-            f"{_fmt(ex.get('followers'))} followers | {ex.get('location') or '—'} | {t['total']:.1f}s")
+        return f"#{job.seq:02d} | 🛑 FAILED | Error: {job.err}"
+    tag = {"new": "✅ NEW", "duplicate": "⚠️ DUP", "email_not_found": "❌ NO_EMAIL"}[job.status]
+    return f"#{job.seq:02d} | {tag:<9} | {job.email or '—':<28} | @{uname:<18} | {_fmt(ex.get('followers'))} followers | {t['total']:.1f}s"
 
 
 async def send_result(bot, job: Job, caption: str):
     try:
         await tg_call(job.message.reply_photo, photo=job.file_id, caption=caption)
     except Exception:
-        log.debug("reply_photo failed, falling back to send_photo", exc_info=True)
         await tg_call(bot.send_photo, chat_id=job.batch.chat_id, photo=job.file_id, caption=caption)
 
 
@@ -1027,32 +1088,52 @@ async def queue_worker(app: Application, wid: int):
         started = time.perf_counter()
         job.t["wait"] = time.time() - job.queued_at
         b.running[job.seq] = time.time()
-        try:
-            await process_job(bot, job)
-        except Exception as exc:
-            log.exception("Processing failed for screenshot #%d", job.seq)
+
+        # Capture actual exception text instead of swallowing it
+        success = False
+        last_exc: Exception | None = None
+        for attempt in range(2):
+            try:
+                await process_job(bot, job)
+                success = True
+                break
+            except Exception as exc:
+                last_exc = exc
+                log.warning("[JOB #%d] Attempt %d failed: %s", job.seq, attempt + 1, exc, exc_info=True)
+                await asyncio.sleep(1.0)
+
+        if not success:
             job.status = "failed"
-            job.err = short_err(exc)
-        finally:
-            job.t["total"] = time.perf_counter() - started
-            b.running.pop(job.seq, None)
-            b.done += 1
-            if job.status == "new":
-                b.new += 1
-            elif job.status == "duplicate":
-                b.dup += 1
-            elif job.status == "email_not_found":
-                b.no_email += 1
-            else:
-                b.failed += 1
+            job.err = short_err(last_exc) if last_exc else "Unknown failure"
+            b.failed_jobs.append(job)
+
+        job.t["total"] = time.perf_counter() - started
+        b.running.pop(job.seq, None)
+        b.done += 1
+        if job.status == "new":
+            b.new += 1
+        elif job.status == "duplicate":
+            b.dup += 1
+        elif job.status == "email_not_found":
+            b.no_email += 1
+        else:
+            b.failed += 1
 
         try:
             await send_result(bot, job, build_caption(job))
         except Exception:
-            log.exception("Could not send result photo for #%d", job.seq)
+            log.exception("Could not dispatch result message for #%d", job.seq)
+
         b.lines.append((job.seq, summary_line(job)))
         b.sent += 1
         q.task_done()
+
+        # Refill queue: Keep active queue filled up to BATCH_CHUNK_SIZE
+        b.active_dispatched = max(0, b.active_dispatched - 1)
+        if b.pending_buffer and b.active_dispatched < BATCH_CHUNK_SIZE:
+            next_job = b.pending_buffer.pop(0)
+            b.active_dispatched += 1
+            await q.put(next_job)
 
 
 def progress_text(b: Batch, final: bool = False) -> str:
@@ -1060,41 +1141,42 @@ def progress_text(b: Batch, final: bool = False) -> str:
     elapsed = now - b.started
     total = max(b.total, 1)
     filled = int(10 * b.done / total)
-    bar = "█" * filled + "░" * (10 - filled)
+    bar = "=" * filled + "-" * (10 - filled)
     running = sorted(b.running.items())
-    running_txt = ", ".join(f"#{s} ({now - t0:.0f}s)" for s, t0 in running[:6]) or "—"
+    running_txt = ", ".join(f"#{s} ({now - t0:.0f}s)" for s, t0 in running[:6]) or "None"
     waiting = max(0, b.total - b.done - len(b.running))
 
-    timing = f"⏱ Elapsed {fmt_secs(elapsed)}"
+    timing = f"Elapsed: {fmt_secs(elapsed)}"
     if b.done:
         avg = elapsed / b.done
-        timing += f" | Avg {avg:.1f}s/img"
+        timing += f" | Avg: {avg:.1f}s/img"
         if not final and b.done < b.total:
-            timing += f" | ETA ~{fmt_secs(avg * (b.total - b.done))}"
+            timing += f" | ETA: ~{fmt_secs(avg * (b.total - b.done))}"
 
-    title = "🏁 Batch complete" if final else "⚙️ Processing batch"
+    title = "BATCH COMPLETED" if final else "PROCESSING BATCH"
+    chunk_info = f" (Chunk window: {BATCH_CHUNK_SIZE})" if b.total > BATCH_CHUNK_SIZE else ""
+
     text = (
-        f"{title}\n"
-        f"{bar} {b.done}/{b.total}\n\n"
-        f"✅ New: {b.new} | ⚠️ Dup: {b.dup} | ❌ No email: {b.no_email} | 🛑 Failed: {b.failed}\n"
+        f"[{title}]{chunk_info}\n"
+        f"[{bar}] {b.done}/{b.total}\n\n"
+        f"Verified Leads: {b.new} | Duplicate: {b.dup} | No Email: {b.no_email} | Failed: {b.failed}\n"
     )
     if not final:
-        text += f"🔄 Running now: {running_txt}\n⏳ Waiting in queue: {waiting}\n"
-    text += f"{timing}\n🧵 Parallel workers: {OCR_WORKERS}"
+        text += f"Active Slots: {running_txt}\nPending in Queue: {waiting}\n"
+    text += f"{timing}\nWorkers Active: {OCR_WORKERS} Parallel slots"
     return text
 
 
 async def batch_watcher(bot, member: dict, b: Batch):
-    """One per batch: keeps a live progress message and sends the final summary."""
     try:
         b.progress_msg = await tg_call(bot.send_message, b.chat_id, progress_text(b))
     except Exception:
-        log.exception("Could not send progress message")
+        log.exception("Could not initiate progress notification")
 
     last_text = ""
     while True:
         await asyncio.sleep(PROGRESS_EVERY)
-        if b.sent >= b.total and time.time() - b.last_added >= BATCH_IDLE_SECS:
+        if b.sent >= b.total and len(b.pending_buffer) == 0 and time.time() - b.last_added >= BATCH_IDLE_SECS:
             b.finished = True
             break
         text = progress_text(b)
@@ -1111,17 +1193,106 @@ async def batch_watcher(bot, member: dict, b: Batch):
         count = "?"
 
     header = (
-        f"🏁 Done: {b.total} screenshots in {fmt_secs(time.time() - b.started)}\n"
-        f"✅ New: {b.new} | ⚠️ Duplicate: {b.dup} | ❌ No email: {b.no_email} | 🛑 Failed: {b.failed}\n"
-        f"Your unique emails today: {count}/{DAILY_TARGET}\n\n"
+        f"FINAL BATCH AUDIT\n"
+        f"Processed {b.total} screenshots in {fmt_secs(time.time() - b.started)}\n"
+        f"New Unique: {b.new} | Duplicate: {b.dup} | No Email: {b.no_email} | Failed: {b.failed}\n"
+        f"Your Total Unique Leads Today: {count}/{DAILY_TARGET}\n"
+        f"{'=' * 40}\n"
     )
     body = "\n".join(line for _, line in sorted(b.lines))
-    text = header + body
-    for i in range(0, len(text), 3800):
-        await tg_call(bot.send_message, b.chat_id, text[i:i + 3800])
+    full_report = header + body
+
+    for i in range(0, len(full_report), 3800):
+        await tg_call(bot.send_message, b.chat_id, full_report[i:i + 3800])
+
+    if b.failed_jobs:
+        await tg_call(
+            bot.send_message,
+            b.chat_id,
+            f"ATTENTION: {len(b.failed_jobs)} screenshot(s) could not be processed. Dispatched below for review:"
+        )
+        for failed_job in b.failed_jobs:
+            caption = f"FAILED SCREENSHOT #{failed_job.seq}\nReason: {failed_job.err}\nPlease re-send this screenshot."
+            try:
+                await tg_call(bot.send_photo, chat_id=b.chat_id, photo=failed_job.file_id, caption=caption)
+            except Exception:
+                log.exception("Could not dispatch failed photo notification for #%d", failed_job.seq)
 
 
 # ----------------------------------------------------------------- Telegram Handlers
+def is_admin(uid: int) -> bool:
+    return uid == ADMIN_ID
+
+
+_MEMBER_CACHE: dict[int, tuple[float, dict]] = {}
+_MEMBER_TTL = 60.0
+
+
+async def get_member(uid: int):
+    cached = _MEMBER_CACHE.get(uid)
+    if cached and time.time() - cached[0] < _MEMBER_TTL:
+        return cached[1]
+    res = await run_db(lambda: db.table("team_members").select("*").eq("telegram_user_id", uid).eq("active", True).limit(1).execute())
+    member = res.data[0] if res.data else None
+    if member:
+        _MEMBER_CACHE[uid] = (time.time(), member)
+    else:
+        _MEMBER_CACHE.pop(uid, None)
+    return member
+
+
+async def get_daily_count(member_id: str) -> int:
+    today_iso = now_local().date().isoformat()
+    res = await run_db(lambda: db.rpc("get_member_daily_progress", {"p_member_id": member_id, "p_day": today_iso}).execute())
+    data = res.data[0] if isinstance(res.data, list) else res.data
+    return int(data.get("email_count", 0)) if data else 0
+
+
+def _fmt(val):
+    return val if val is not None else "—"
+
+
+def short_err(exc: Exception) -> str:
+    text = re.sub(r"<[^>]+>", " ", str(exc))
+    text = re.sub(r"\\\\r\\\\n|\\r\\n|\s+", " ", text).strip()
+    return text[:160]
+
+
+async def reply(update: Update, text: str):
+    if update.effective_message:
+        await update.effective_message.reply_text(text)
+
+
+async def tg_call(fn, *args, retries: int = 5, **kwargs):
+    for attempt in range(retries):
+        try:
+            return await fn(*args, **kwargs)
+        except RetryAfter as exc:
+            wait = exc.retry_after
+            wait = wait.total_seconds() if hasattr(wait, "total_seconds") else float(wait)
+            log.warning("Telegram flood limit reached, sleeping %.1fs", wait)
+            await asyncio.sleep(wait + 0.5)
+        except (TimedOut, NetworkError) as exc:
+            log.warning("Telegram network issue (%s), retry %d/%d", exc, attempt + 1, retries)
+            await asyncio.sleep(1 + attempt)
+    return await fn(*args, **kwargs)
+
+
+async def safe_edit(msg, text: str):
+    try:
+        await tg_call(msg.edit_text, text)
+    except BadRequest as exc:
+        if "not modified" not in str(exc).lower():
+            log.debug("Message edit omitted: %s", exc)
+    except Exception:
+        pass
+
+
+def fmt_secs(s: float) -> str:
+    s = int(max(0, s))
+    return f"{s // 60:02d}:{s % 60:02d}"
+
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     if not user:
@@ -1134,9 +1305,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         }, on_conflict="telegram_user_id").execute())
         await reply(update, "Registered as admin.\nSend Instagram profile screenshots (one or many) to extract leads.")
     elif await get_member(user.id):
-        await reply(update, "You're registered. Send Instagram profile screenshots (one or many).")
+        await reply(update, "Welcome back. Send your creator screenshots to begin extraction.")
     else:
-        await reply(update, "You are not on the allowlist. Ask the admin to add you.")
+        await reply(update, "Access restricted. Please contact the administrator to be allowlisted.")
 
 
 async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1144,7 +1315,15 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not user or not await get_member(user.id):
         return
     q: asyncio.Queue = context.application.bot_data["queue"]
-    await reply(update, f"🟢 Online\n🧵 Workers: {OCR_WORKERS} (x{OCR_THREADS} ONNX threads)\n🗄 DB concurrency: {DB_MAX_CONCURRENCY}\n📥 Queue: {q.qsize()}")
+    status_text = (
+        "SYSTEM HEALTH MONITOR\n"
+        f"Engine: Online\n"
+        f"Parallel OCR Slots: {OCR_WORKERS} (x{OCR_THREADS} ONNX threads)\n"
+        f"Throttled Chunk Window: {BATCH_CHUNK_SIZE} images\n"
+        f"Database Concurrency: {DB_MAX_CONCURRENCY}\n"
+        f"Active Processing Queue: {q.qsize()}"
+    )
+    await reply(update, status_text)
 
 
 async def process_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1152,7 +1331,7 @@ async def process_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not user or not msg or (update.effective_chat and update.effective_chat.type != ChatType.PRIVATE):
         return
 
-    log.info("--- [NEW SCREENSHOT] from @%s (ID: %d) ---", user.username, user.id)
+    log.info("--- [NEW SCREENSHOT ENQUEUED] from @%s (ID: %d) ---", user.username, user.id)
     try:
         member = await get_member(user.id)
     except Exception:
@@ -1175,15 +1354,22 @@ async def process_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     batch.last_added = now
     job = Job(batch=batch, member=member, message=msg, file_id=msg.photo[-1].file_id,
               seq=batch.total, queued_at=now)
-    await context.application.bot_data["queue"].put(job)
+
+    q: asyncio.Queue = context.application.bot_data["queue"]
+
+    if batch.active_dispatched < BATCH_CHUNK_SIZE and q.qsize() < BATCH_CHUNK_SIZE:
+        batch.active_dispatched += 1
+        await q.put(job)
+    else:
+        batch.pending_buffer.append(job)
 
 
-# ----------------------------------------------------------------- Optional health server
+# ----------------------------------------------------------------- Health Server & Runner
 class HealthCheckHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.end_headers()
-        self.wfile.write(b"Bot is running!")
+        self.wfile.write(b"Bot service healthy")
 
     def log_message(self, format, *args):
         pass
@@ -1197,13 +1383,13 @@ def run_web_server():
 
 async def post_init(app: Application):
     app.bot_data["queue"] = asyncio.Queue()
-    _get_db_sem()  # create the semaphore inside the running loop
+    _get_db_sem()
     await warm_up_engines()
     app.bot_data["workers"] = [
         asyncio.create_task(queue_worker(app, i)) for i in range(OCR_WORKERS + IO_EXTRA_WORKERS)
     ]
-    log.info("Started %d queue workers (%d parallel OCR slots, DB concurrency %d)",
-             OCR_WORKERS + IO_EXTRA_WORKERS, OCR_WORKERS, DB_MAX_CONCURRENCY)
+    log.info("System ready. Initialized %d worker threads (Chunk limit: %d)",
+             OCR_WORKERS + IO_EXTRA_WORKERS, BATCH_CHUNK_SIZE)
 
 
 async def post_shutdown(app: Application):
@@ -1215,7 +1401,7 @@ async def post_shutdown(app: Application):
 def main():
     if os.getenv("RUN_HEALTH_SERVER", "0") == "1":
         threading.Thread(target=run_web_server, daemon=True).start()
-        log.info("Health check server started on port %s", os.getenv("PORT", 8080))
+        log.info("Health check server running on port %s", os.getenv("PORT", 8080))
 
     req = HTTPXRequest(connection_pool_size=32, connect_timeout=30.0, read_timeout=60.0,
                        write_timeout=60.0, pool_timeout=30.0)
@@ -1232,7 +1418,7 @@ def main():
     app.add_handler(CommandHandler("status", status_cmd))
     app.add_handler(MessageHandler(filters.PHOTO, process_photo))
 
-    log.info("Starting Telegram bot with 20x Deep RapidOCR engine (parallel bulk mode)")
+    log.info("Starting production scraper engine with throttled chunk queue (Size: %d)", BATCH_CHUNK_SIZE)
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
